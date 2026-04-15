@@ -7,6 +7,7 @@ import os
 import re
 import hashlib
 import time
+from pathlib import Path
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -86,11 +87,12 @@ LIMIT_MIN = 1
 LIMIT_MAX = 200
 TRACK_DEDUP_WINDOW_SEC_VIEW = 600.0
 TRACK_DEDUP_WINDOW_SEC_CLICK = 600.0
+ENABLE_SEED_DATA = True
 WEIGHTS = {
-    "click": 1.0,
-    "popularity": 0.5,
-    "recency": 0.3,
-    "semantic": 0.8,
+    "click": 1.5,
+    "popularity": 0.3,
+    "recency": 0.7,
+    "semantic": 0.65,
 }
 TOTAL_BOOST_CAP = 1.5
 TEST_QUERIES = [
@@ -104,6 +106,7 @@ TEST_QUERIES = [
 logger = logging.getLogger(__name__)
 _track_seen: dict[str, float] = {}
 _embedding_cache: dict[str, list[float]] = {}
+_seed_cache: list[dict[str, Any]] | None = None
 
 
 class SearchAISection(BaseModel):
@@ -422,9 +425,119 @@ def _events_for_ai_context(*, limit: int = 75) -> list[dict[str, Any]]:
     return deduped
 
 
+def remove_seed_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [e for e in events if not e.get("is_seed")]
+
+
+def _seed_file_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "data" / "seed_events.json"
+
+
+def _load_seed_events() -> list[dict[str, Any]]:
+    global _seed_cache
+    if _seed_cache is not None:
+        return _seed_cache
+    path = _seed_file_path()
+    if not path.exists():
+        _seed_cache = []
+        return _seed_cache
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        _seed_cache = []
+        return _seed_cache
+    if not isinstance(raw, list):
+        _seed_cache = []
+        return _seed_cache
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("id") or "").strip()
+        if not sid:
+            continue
+        title = str(item.get("title") or "").strip() or sid
+        description = str(item.get("description") or "").strip()
+        category = str(item.get("category") or "").strip().lower()
+        location = str(item.get("location") or "").strip() or "Lake Havasu City"
+        popularity = int(item.get("popularity") or 1)
+        event_time = str(item.get("event_time") or "").strip()
+        tags = [t for t in re.split(r"[^a-z0-9]+", f"{category} {title}".lower()) if len(t) >= 3][:8]
+        row: dict[str, Any] = {
+            "id": sid,
+            "event_ref": sid,
+            "title": title,
+            "description": description,
+            "category": category,
+            "tags": tags,
+            "location": location,
+            "location_label": location,
+            "source": "seed",
+            "is_seed": bool(item.get("is_seed", True)),
+            "view_count": 0,
+            "click_count": max(0, popularity),
+        }
+        if event_time:
+            row["start_date"] = event_time
+            row["end_date"] = event_time
+            row["is_active_now"] = False
+        out.append(row)
+    _seed_cache = out
+    return out
+
+
+def _parse_event_datetime_for_filter(row: dict[str, Any]) -> datetime | None:
+    # Prefer end date/time when available so multi-day events stay eligible
+    # until they actually pass.
+    preferred = [str(row.get("end_date") or "").strip(), str(row.get("start_date") or "").strip()]
+    for raw in preferred:
+        if not raw:
+            continue
+        dt = _parse_start_datetime(raw)
+        if dt is not None:
+            return dt
+        try:
+            d = date.fromisoformat(raw[:10])
+            return datetime(d.year, d.month, d.day)
+        except ValueError:
+            continue
+    return None
+
+
+def _filter_stale_ai_events(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    cutoff = datetime.utcnow() - timedelta(hours=24)
+    kept: list[dict[str, Any]] = []
+    removed_example: dict[str, str] | None = None
+    removed_count = 0
+    for row in events:
+        dt = _parse_event_datetime_for_filter(row)
+        if dt is None:
+            kept.append(row)
+            continue
+        if dt < cutoff:
+            removed_count += 1
+            if removed_example is None:
+                removed_example = {
+                    "id": str(row.get("id") or ""),
+                    "title": str(row.get("title") or ""),
+                    "start_date": str(row.get("start_date") or ""),
+                    "end_date": str(row.get("end_date") or ""),
+                }
+            continue
+        kept.append(row)
+
+    stats = {
+        "total_events_before_filter": len(events),
+        "total_events_after_filter": len(kept),
+        "filtered_out_count": removed_count,
+        "removed_stale_example": removed_example,
+    }
+    return kept, stats
+
+
 def _format_for_ai(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for e in events[:75]:
+    for e in events[:200]:
         out.append(
             {
                 "id": str(e.get("id") or ""),
@@ -584,11 +697,16 @@ def _normalize_signal(value: float, max_value: float) -> float:
 
 def _recency_signal(start_raw: str, now: datetime) -> float:
     start_dt = _parse_start_datetime(start_raw)
-    if start_dt is None or start_dt < now:
+    if start_dt is None:
         return 0.0
-    # Decay over a 72-hour window; near-term events get strongest recency signal.
-    hours_until = (start_dt - now).total_seconds() / 3600.0
-    return max(0.0, min(1.0, 1.0 - (hours_until / 72.0)))
+    delta_hours = (start_dt - now).total_seconds() / 3600.0
+    # Very old items should not get a recency boost.
+    if delta_hours < -24.0:
+        return 0.0
+    # Exponential decay keeps near-term items meaningful while avoiding flat zeros.
+    if delta_hours >= 0.0:
+        return max(0.0, min(1.0, math.exp(-delta_hours / 72.0)))
+    return max(0.0, min(1.0, math.exp(-abs(delta_hours) / 48.0)))
 
 
 def _parse_start_datetime(value: str) -> datetime | None:
@@ -781,7 +899,12 @@ def _build_debug_breakdown(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 @app.post("/ai/recommend")
 def ai_recommend(body: AIRecommendRequest, debug: bool = Query(False)) -> list[AIRecommendation] | dict[str, Any]:
     query = body.query.strip()
-    events = _events_for_ai_context(limit=75)
+    real_events = _events_for_ai_context(limit=150)
+    seed_events = _load_seed_events() if ENABLE_SEED_DATA else []
+    events = real_events + seed_events
+    events, filter_stats = _filter_stale_ai_events(events)
+    filter_stats["seed_event_count"] = len(seed_events)
+    filter_stats["real_event_count"] = len(real_events)
     payload = _format_for_ai(events)
     if not payload:
         return []
@@ -815,6 +938,7 @@ def ai_recommend(body: AIRecommendRequest, debug: bool = Query(False)) -> list[A
                 "results": [x.model_dump() for x in final],
                 "breakdown": _build_debug_breakdown(fallback_ranked),
                 "weights": WEIGHTS,
+                "eligibility": filter_stats,
             }
         return final
 
@@ -875,6 +999,7 @@ def ai_recommend(body: AIRecommendRequest, debug: bool = Query(False)) -> list[A
                         "results": [x.model_dump() for x in final],
                         "breakdown": _build_debug_breakdown(boosted),
                         "weights": WEIGHTS,
+                        "eligibility": filter_stats,
                     }
                 return final
     except Exception as exc:
@@ -898,6 +1023,7 @@ def ai_recommend(body: AIRecommendRequest, debug: bool = Query(False)) -> list[A
             "results": [x.model_dump() for x in final],
             "breakdown": _build_debug_breakdown(fallback_ranked),
             "weights": WEIGHTS,
+            "eligibility": filter_stats,
         }
     return final
 
