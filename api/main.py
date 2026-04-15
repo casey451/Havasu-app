@@ -1,0 +1,915 @@
+from __future__ import annotations
+
+import logging
+import os
+import re
+import time
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from datetime import date, timedelta
+
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from api.rate_limit import RateLimitMiddleware
+from api.routers import admin_routes, auth, business_routes
+
+from core.calendar_filters import include_in_homepage_calendar_lists
+from core.ai_helper import fallback_generic_suggestions, generate_suggestions, should_use_ai
+from core.discover import get_fallback_rows, get_popular, get_today, get_weekend
+from core.intent_map import parse_intent
+from core.query_expand import expand_query, match_rows_for_queries, should_expand
+from core.search_rank import rank_search_results
+from core.serialize import (
+    MISSING_TIME_SORT,
+    coalesce_str,
+    finalize_api_list,
+    homepage_calendar_sort_key,
+    time_sort_value,
+)
+from core.user_event_map import map_user_event_row_to_item_payload
+from db.accounts import (
+    get_business_by_id,
+    get_user_event_with_profile_fields,
+    list_user_event_payloads_for_public,
+)
+from db.activities import (
+    ActivityInput,
+    SlotInput,
+    delete_activity,
+    increment_activity_click,
+    increment_activity_view,
+    ingest_activity,
+    list_expanded_slot_payloads,
+    list_pending_activities,
+    set_activity_status,
+)
+from db.database import count_events_by_source, get_item_payload_by_id, init_db, list_events, list_items
+from db.submissions import (
+    clear_submission_featured,
+    create_submission,
+    delete_submission,
+    find_duplicate_submission_id,
+    increment_submission_click,
+    increment_submission_view,
+    list_notifications_feed,
+    list_approved_submission_payloads,
+    list_pending_submissions,
+    list_submissions,
+    set_submission_featured,
+    update_submission_status,
+)
+
+LIMIT_DEFAULT = 100
+LIMIT_MIN = 1
+LIMIT_MAX = 200
+TRACK_DEDUP_WINDOW_SEC_VIEW = 600.0
+TRACK_DEDUP_WINDOW_SEC_CLICK = 600.0
+
+logger = logging.getLogger(__name__)
+_track_seen: dict[str, float] = {}
+
+
+class SearchAISection(BaseModel):
+    suggestions: list[str] = Field(default_factory=list)
+
+
+class SearchResponse(BaseModel):
+    results: list[dict[str, Any]] = Field(default_factory=list)
+    ai: SearchAISection | None = None
+
+
+class DiscoverResponse(BaseModel):
+    today: list[dict[str, Any]] = Field(default_factory=list)
+    weekend: list[dict[str, Any]] = Field(default_factory=list)
+    popular: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SubmitRequest(BaseModel):
+    title: str
+    description: str = ""
+    tags: list[str] = Field(default_factory=list)
+    category: str
+    start_date: str | None = None
+    location: str = "Lake Havasu"
+
+
+class SubmitResponse(BaseModel):
+    success: bool
+    id: str | None = None
+    duplicate: bool = False
+
+
+class SubmitActivitySlot(BaseModel):
+    start_time: str
+    end_time: str
+    day_of_week: int | None = Field(default=None, ge=0, le=6)
+    date: str | None = None
+    recurring: bool = False
+
+
+class SubmitActivityRequest(BaseModel):
+    title: str
+    location: str
+    category: str = "events"
+    tags: list[str] = Field(default_factory=list)
+    time_slots: list[SubmitActivitySlot] = Field(default_factory=list)
+    description: str = ""
+
+
+class TrackRequest(BaseModel):
+    id: str = Field(..., min_length=1)
+
+
+class NotificationFeedItem(BaseModel):
+    id: str
+    event_ref: str
+    title: str
+    type: str
+    start_date: str
+    source: str
+    is_featured: bool = False
+    featured_until: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class NotificationFeedResponse(BaseModel):
+    items: list[NotificationFeedItem] = Field(default_factory=list)
+
+
+def _sanitize_ai_suggestions(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return fallback_generic_suggestions()
+    out = [str(x).strip() for x in value if x is not None and str(x).strip()]
+    return out[:3] if out else fallback_generic_suggestions()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(
+    title="Lake Havasu Discovery API",
+    version="0.3.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3002"],
+    allow_origin_regex=r"http://localhost(:\d+)?",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.add_middleware(RateLimitMiddleware)
+
+
+def _is_valid_admin_token_header(header_value: str | None) -> bool:
+    expected = (os.getenv("ADMIN_TOKEN") or "").strip()
+    if not expected:
+        return False
+    if not isinstance(header_value, str):
+        return False
+    prefix = "Bearer "
+    if not header_value.startswith(prefix):
+        return False
+    provided = header_value[len(prefix) :].strip()
+    return bool(provided) and provided == expected
+
+
+@app.middleware("http")
+async def enforce_admin_token(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if request.url.path.startswith("/admin/"):
+        if not _is_valid_admin_token_header(request.headers.get("Authorization")):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    return await call_next(request)
+
+app.include_router(auth.router, prefix="/auth", tags=["auth"])
+app.include_router(admin_routes.router)
+app.include_router(business_routes.router)
+
+_WEEKDAY_ORDER = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
+def _parse_iso_date(value: str | None) -> date | None:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return None
+
+
+def _event_date_span(event: dict) -> tuple[date | None, date | None]:
+    start = _parse_iso_date(event.get("start_date"))
+    end = _parse_iso_date(event.get("end_date"))
+    if start is not None and end is None:
+        end = start
+    return start, end
+
+
+def _upcoming_weekend_bounds(today: date) -> tuple[date, date]:
+    wd = today.weekday()
+    if wd <= 3:
+        fri = today + timedelta(days=4 - wd)
+    elif wd == 4:
+        fri = today
+    else:
+        fri = today - timedelta(days=wd - 4)
+    sun = fri + timedelta(days=2)
+    return fri, sun
+
+
+def _all_events() -> list[dict]:
+    return list_events(source=None)
+
+
+def _upcoming_event_payloads() -> list[dict]:
+    today = date.today()
+    picked: list[dict] = []
+    for e in _all_events():
+        start, _ = _event_date_span(e)
+        if start is None:
+            continue
+        if start >= today:
+            picked.append(e)
+    return picked
+
+
+_HOME_EVENTS_LIMIT = 10
+
+
+def _crawler_items_for_query(
+    item_type: str | None,
+    source: str | None,
+) -> list[dict]:
+    return list_items(item_type=item_type or None, source=source or None)
+
+
+def _combined_read_rows(item_type: str | None, source: str | None) -> list[dict]:
+    """Crawler `items` plus approved `user_events` where filters allow."""
+    t = item_type
+    src = source
+    if src == "user":
+        u = list_user_event_payloads_for_public() + list_approved_submission_payloads()
+        if t in ("recurring", "program"):
+            return []
+        if t in (None, "event"):
+            return u
+        return []
+    if t in ("recurring", "program"):
+        return _crawler_items_for_query(t, src)
+    crawl = _crawler_items_for_query(t, src)
+    if t in (None, "event"):
+        return crawl + list_user_event_payloads_for_public() + list_approved_submission_payloads()
+    return crawl
+
+
+def _all_calendar_event_payloads() -> list[dict]:
+    """All dated calendar events: crawled + user-submitted."""
+    return list_events(source=None) + list_user_event_payloads_for_public() + list_approved_submission_payloads()
+
+
+def _normalize_submit_tags(tags: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in tags:
+        s = str(t).strip().lower()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out[:12]
+
+
+def _tracking_now() -> float:
+    return time.monotonic()
+
+
+def _client_ip_from_request(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _tracking_should_increment(
+    *,
+    action: str,
+    submission_id: str,
+    request: Request,
+) -> bool:
+    now = _tracking_now()
+    max_window = max(TRACK_DEDUP_WINDOW_SEC_VIEW, TRACK_DEDUP_WINDOW_SEC_CLICK)
+    cutoff = now - max_window
+    stale_keys = [k for k, ts in _track_seen.items() if ts < cutoff]
+    for k in stale_keys:
+        _track_seen.pop(k, None)
+
+    window = TRACK_DEDUP_WINDOW_SEC_VIEW if action == "view" else TRACK_DEDUP_WINDOW_SEC_CLICK
+    ip = _client_ip_from_request(request)
+    key = f"{ip}:{submission_id}:{action}"
+    last = _track_seen.get(key)
+    if last is not None and (now - last) < window:
+        return False
+    _track_seen[key] = now
+    return True
+
+
+def _is_junk_title(title: str) -> bool:
+    t = " ".join(title.strip().lower().split())
+    if len(t) < 5:
+        return True
+    if re.fullmatch(r"[\W\d_]+", t):
+        return True
+    if re.fullmatch(r"[a-z]{1,4}", t):
+        return True
+    spam_tokens = {"test", "asdf", "12345"}
+    if t in spam_tokens:
+        return True
+    return False
+
+
+@app.get("/items")
+def get_items(
+    item_type: str | None = Query(
+        None,
+        alias="type",
+        description="Item kind: event | recurring | program (omit for all types)",
+    ),
+    source: str | None = Query(None, description="Filter by crawler source"),
+    weekday: str | None = Query(
+        None,
+        description="For recurring: filter by weekday name (e.g. Monday)",
+    ),
+    limit: int = Query(LIMIT_DEFAULT, ge=LIMIT_MIN, le=LIMIT_MAX),
+    expand: bool = Query(
+        False,
+        description="If true, return full payload_json-style dicts (legacy).",
+    ),
+) -> list[dict]:
+    """Stored items with optional filters; sorted (start_date, start_time, title)."""
+    t = item_type.strip() if item_type else None
+    src = source.strip() if source else None
+    wd = weekday.strip() if weekday else None
+    allowed = ("event", "recurring", "program")
+    if t and t not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"type must be one of: {', '.join(allowed)}",
+        )
+    rows = _combined_read_rows(t or None, src or None)
+    if wd:
+        wdl = wd.lower()
+        rows = [
+            r
+            for r in rows
+            if isinstance(r.get("weekday"), str) and r.get("weekday", "").strip().lower() == wdl
+        ]
+    return finalize_api_list(rows, expand)[:limit]
+
+
+@app.get("/search", response_model=SearchResponse)
+def search_items(
+    q: str = Query(..., min_length=1, description="Substring match on title (case-insensitive)"),
+    item_type: str | None = Query(None, alias="type", description="Limit to event | recurring | program"),
+    source: str | None = Query(None, description="Filter by source"),
+    limit: int = Query(LIMIT_DEFAULT, ge=LIMIT_MIN, le=LIMIT_MAX),
+    expand: bool = Query(False, description="Return full payloads if true"),
+) -> SearchResponse:
+    query_lower = q.strip().lower()
+    if not query_lower:
+        raise HTTPException(status_code=400, detail="q must not be empty")
+    t = item_type.strip() if item_type else None
+    src = source.strip() if source else None
+    allowed = ("event", "recurring", "program")
+    if t and t not in allowed:
+        raise HTTPException(status_code=400, detail=f"type must be one of: {', '.join(allowed)}")
+    try:
+        rows = _combined_read_rows(t or None, src or None)
+        if not isinstance(rows, list):
+            rows = []
+        intent = parse_intent(q)
+        if should_expand(intent, q):
+            expanded_queries = expand_query(q)
+        else:
+            expanded_queries = [q.strip()]
+        if not isinstance(expanded_queries, list) or not expanded_queries:
+            expanded_queries = [q.strip()]
+        matched = match_rows_for_queries(rows, expanded_queries)
+        if not isinstance(matched, list):
+            matched = []
+        if not matched:
+            matched = get_fallback_rows()
+        results = rank_search_results(matched, q, intent, expand, limit)
+        if not isinstance(results, list):
+            results = []
+        ai_payload: SearchAISection | None = None
+        if should_use_ai(results, intent):
+            raw = generate_suggestions(q, intent, results)
+            sugs = raw.get("suggestions") if isinstance(raw, dict) else None
+            ai_payload = SearchAISection(suggestions=_sanitize_ai_suggestions(sugs))
+        if os.getenv("DEBUG_SEARCH", "").strip() == "1":
+            print("QUERY:", q)
+            print("INTENT:", intent)
+            print("EXPANDED:", expanded_queries)
+            print("TOP 3:", [r.get("title") for r in results[:3]])
+        return SearchResponse(results=results, ai=ai_payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("search failed: %s", exc)
+        return SearchResponse(
+            results=[],
+            ai=SearchAISection(suggestions=fallback_generic_suggestions()),
+        )
+
+
+@app.get("/discover", response_model=DiscoverResponse)
+def discover() -> DiscoverResponse:
+    rows = _combined_read_rows(None, None) + list_expanded_slot_payloads()
+    rows = rows if isinstance(rows, list) else []
+    normalized = finalize_api_list(rows, False)
+    today_rows = get_today(normalized)
+    weekend_rows = get_weekend(normalized)
+    popular_rows = get_popular(normalized)
+    return DiscoverResponse(today=today_rows, weekend=weekend_rows, popular=popular_rows)
+
+
+@app.post("/submit", response_model=SubmitResponse)
+def submit_item(body: SubmitRequest) -> SubmitResponse:
+    title = body.title.strip()
+    start_date = (body.start_date or "").strip()
+    location = (body.location or "").strip()
+    if not title or not start_date or not location:
+        return JSONResponse(status_code=400, content={"error": "invalid_submission"})
+    if _is_junk_title(title):
+        return JSONResponse(status_code=400, content={"error": "invalid_submission"})
+    category = body.category.strip().lower()
+    if category not in ("event", "service"):
+        raise HTTPException(status_code=400, detail="category must be event or service")
+    if "havasu" not in location.lower():
+        raise HTTPException(status_code=400, detail="Only Lake Havasu submissions are allowed")
+    dup_id = find_duplicate_submission_id(
+        normalized_title=" ".join(title.lower().split()),
+        start_date=start_date,
+    )
+    if dup_id:
+        return SubmitResponse(success=True, id=dup_id, duplicate=True)
+    sid = create_submission(
+        title=title,
+        description=(body.description or "").strip(),
+        tags=_normalize_submit_tags(body.tags),
+        category=category,
+        start_date=start_date,
+        location=location,
+    )
+    return SubmitResponse(success=True, id=sid)
+
+
+@app.post("/submit-activity", response_model=SubmitResponse)
+def submit_activity(body: SubmitActivityRequest) -> SubmitResponse:
+    title = body.title.strip()
+    location = body.location.strip()
+    if not title or not location or not body.time_slots:
+        return JSONResponse(status_code=400, content={"error": "invalid_submission"})
+    if _is_junk_title(title):
+        return JSONResponse(status_code=400, content={"error": "invalid_submission"})
+    if "havasu" not in location.lower():
+        raise HTTPException(status_code=400, detail="Only Lake Havasu submissions are allowed")
+
+    slots: list[SlotInput] = []
+    for slot in body.time_slots:
+        slots.append(
+            SlotInput(
+                start_time=slot.start_time.strip(),
+                end_time=slot.end_time.strip(),
+                day_of_week=slot.day_of_week,
+                date=(slot.date or "").strip() or None,
+                recurring=bool(slot.recurring),
+            )
+        )
+
+    activity_id = ingest_activity(
+        ActivityInput(
+            title=title,
+            location=location,
+            activity_type="schedule",
+            category=body.category.strip().lower() or "events",
+            tags=_normalize_submit_tags(body.tags),
+            time_slots=slots,
+            source="user",
+            status="pending",
+            description=(body.description or "").strip(),
+        )
+    )
+    return SubmitResponse(success=True, id=activity_id)
+
+
+@app.get("/admin/pending")
+def admin_pending_submissions() -> list[dict[str, Any]]:
+    return list_pending_submissions() + list_pending_activities()
+
+
+@app.get("/admin/submissions")
+def admin_list_submissions(status: str = Query("pending")) -> list[dict[str, Any]]:
+    s = status.strip().lower()
+    if s not in ("pending", "approved", "rejected"):
+        raise HTTPException(status_code=400, detail="status must be pending|approved|rejected")
+    if s == "pending":
+        return list_submissions("pending")
+    if s == "approved":
+        return list_submissions("approved")
+    return list_submissions("rejected")
+
+
+@app.post("/admin/approve")
+def admin_approve_submission(id: str = Query(..., min_length=1)) -> dict[str, bool]:
+    if id.startswith("a-"):
+        ok = set_activity_status(id, "approved")
+        if not ok:
+            raise HTTPException(status_code=404, detail="Activity not found")
+        return {"success": True}
+    ok = update_submission_status(id, "approved")
+    if not ok:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    return {"success": True}
+
+
+@app.post("/admin/reject")
+def admin_reject_submission(id: str = Query(..., min_length=1)) -> dict[str, bool]:
+    if id.startswith("a-"):
+        ok = delete_activity(id) or set_activity_status(id, "rejected")
+        if not ok:
+            raise HTTPException(status_code=404, detail="Activity not found")
+        return {"success": True}
+    # Keep rejected rows out of pending/live; remove to keep table clean.
+    ok = delete_submission(id) or update_submission_status(id, "rejected")
+    if not ok:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    return {"success": True}
+
+
+@app.post("/admin/feature")
+def admin_feature_submission(
+    id: str = Query(..., min_length=1),
+    days: int = Query(7, ge=1, le=90),
+) -> dict[str, bool]:
+    ok = set_submission_featured(id, days=days)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Approved submission not found")
+    return {"success": True}
+
+
+@app.post("/admin/unfeature")
+def admin_unfeature_submission(id: str = Query(..., min_length=1)) -> dict[str, bool]:
+    ok = clear_submission_featured(id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    return {"success": True}
+
+
+@app.post("/track/view")
+def track_view(body: TrackRequest, request: Request) -> dict[str, bool]:
+    # Silent no-op for unknown IDs to avoid breaking UI flows.
+    try:
+        sid = body.id.strip()
+        if sid and _tracking_should_increment(action="view", submission_id=sid, request=request):
+            ok = increment_submission_view(sid)
+            if not ok:
+                increment_activity_view(sid)
+    except Exception:
+        pass
+    return {"success": True}
+
+
+@app.post("/track/click")
+def track_click(body: TrackRequest, request: Request) -> dict[str, bool]:
+    # Silent no-op for unknown IDs to avoid breaking UI flows.
+    try:
+        sid = body.id.strip()
+        if sid and _tracking_should_increment(action="click", submission_id=sid, request=request):
+            ok = increment_submission_click(sid)
+            if not ok:
+                increment_activity_click(sid)
+    except Exception:
+        pass
+    return {"success": True}
+
+
+@app.get("/notifications/feed", response_model=NotificationFeedResponse)
+def notifications_feed(limit: int = Query(20, ge=1, le=50)) -> NotificationFeedResponse:
+    try:
+        items = list_notifications_feed(limit=limit)
+    except Exception:
+        items = []
+    return NotificationFeedResponse(items=items)
+
+
+@app.get("/today")
+def get_today_view(
+    expand: bool = Query(False, description="Return full payloads if true"),
+) -> dict:
+    """Calendar events on today's date + recurring rows for today's weekday."""
+    today = date.today()
+    today_iso = today.isoformat()
+    today_name = today.strftime("%A")
+
+    events_raw: list[dict] = []
+    for e in _all_calendar_event_payloads():
+        if not include_in_homepage_calendar_lists(e):
+            continue
+        start, end = _event_date_span(e)
+        if start is None:
+            continue
+        if end is None:
+            end = start
+        if start <= today <= end:
+            events_raw.append(e)
+
+    recurring_raw: list[dict] = []
+    for row in list_items(item_type="recurring"):
+        w = row.get("weekday")
+        if not isinstance(w, str) or not w.strip():
+            continue
+        if w.strip().lower() != today_name.lower():
+            continue
+        recurring_raw.append(row)
+
+    events_norm = finalize_api_list(events_raw, expand)
+    events_norm.sort(key=homepage_calendar_sort_key)
+    recurring_norm = finalize_api_list(recurring_raw, expand)
+    recurring_norm.sort(key=homepage_calendar_sort_key)
+
+    return {
+        "date": today_iso,
+        "weekday": today_name,
+        "events": events_norm,
+        "recurring": recurring_norm,
+    }
+
+
+@app.get("/week")
+def get_week_view(
+    expand: bool = Query(False, description="Return full payloads if true"),
+) -> dict:
+    """Events with start_date in the next 7 days (inclusive) + all recurring grouped by weekday."""
+    today = date.today()
+    end = today + timedelta(days=7)
+
+    events_raw: list[dict] = []
+    for e in _all_calendar_event_payloads():
+        if not include_in_homepage_calendar_lists(e):
+            continue
+        start, _ = _event_date_span(e)
+        if start is None:
+            continue
+        if today.isoformat() <= start.isoformat() <= end.isoformat():
+            events_raw.append(e)
+
+    recurring_all = list_items(item_type="recurring")
+    by_wd: dict[str, list[dict]] = defaultdict(list)
+    for r in recurring_all:
+        w = r.get("weekday")
+        if not isinstance(w, str) or not w.strip():
+            continue
+        key = w.strip().title()
+        by_wd[key].append(r)
+    ordered = sorted(by_wd.keys(), key=lambda n: _WEEKDAY_ORDER.get(n.lower(), 99))
+    recurring_by_weekday = {wd: by_wd[wd] for wd in ordered}
+
+    events_norm = finalize_api_list(events_raw, expand)
+    events_norm.sort(key=homepage_calendar_sort_key)
+    recurring_sorted = {
+        wd: sorted(
+            finalize_api_list(recurring_by_weekday[wd], expand),
+            key=homepage_calendar_sort_key,
+        )
+        for wd in ordered
+    }
+
+    return {
+        "start": today.isoformat(),
+        "end": end.isoformat(),
+        "events": events_norm,
+        "recurring_by_weekday": recurring_sorted,
+    }
+
+
+@app.get("/public/event/{event_ref}")
+def get_public_event_by_ref(event_ref: str) -> dict:
+    """
+    Stable public detail: `u-{user_events.id}` for business-submitted events,
+    `c-{items.id}` for crawler/stored items. Returns merged payload (expand=true)
+    so venue/address/description are available for the UI.
+    """
+    if not re.fullmatch(r"[uc]-[0-9]+", event_ref):
+        raise HTTPException(status_code=400, detail="Invalid event reference")
+    kind, _, digits = event_ref.partition("-")
+    num = int(digits)
+    if kind == "u":
+        row = get_user_event_with_profile_fields(num)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Event not found")
+        biz = get_business_by_id(int(row["business_id"]))
+        if (
+            biz is None
+            or str(biz.get("role")) != "business"
+            or str(biz.get("status")) != "approved"
+        ):
+            raise HTTPException(status_code=404, detail="Event not found")
+        raw = map_user_event_row_to_item_payload(dict(row))
+    else:
+        raw = get_item_payload_by_id(num)
+        if raw is None:
+            raise HTTPException(status_code=404, detail="Event not found")
+    out = finalize_api_list([raw], True)
+    return out[0]
+
+
+@app.get("/schedule/today")
+def get_schedule_today(
+    expand: bool = Query(False, description="Return full payloads in items if true"),
+) -> dict:
+    """Today's recurring schedule: sorted and grouped by start_time."""
+    today = date.today()
+    today_name = today.strftime("%A").lower()
+    rows: list[dict] = []
+    for row in list_items(item_type="recurring"):
+        w = row.get("weekday")
+        if not isinstance(w, str) or not w.strip():
+            continue
+        if w.strip().lower() != today_name:
+            continue
+        rows.append(row)
+
+    finalized = finalize_api_list(rows, expand)
+    if expand:
+        by_time: dict[str, list[dict]] = defaultdict(list)
+        for r in finalized:
+            st_key = coalesce_str(r.get("start_time"))
+            by_time[st_key].append(r)
+        sorted_times = sorted(
+            by_time.keys(),
+            key=lambda k: time_sort_value(k) if k else MISSING_TIME_SORT,
+        )
+        grouped = [{"start_time": t or "", "items": by_time[t]} for t in sorted_times]
+        return {
+            "weekday": today.strftime("%A"),
+            "items": finalized,
+            "by_start_time": {t or "": by_time[t] for t in sorted_times},
+            "groups": grouped,
+        }
+    norm = finalized
+    by_norm: dict[str, list[dict]] = defaultdict(list)
+    for n in norm:
+        st_key = n.get("start_time") or ""
+        by_norm[st_key].append(n)
+    sorted_t = sorted(
+        by_norm.keys(),
+        key=lambda k: time_sort_value(k) if k else MISSING_TIME_SORT,
+    )
+    grouped_n = [{"start_time": t, "items": by_norm[t]} for t in sorted_t]
+    return {
+        "weekday": today.strftime("%A"),
+        "items": norm,
+        "by_start_time": {t: by_norm[t] for t in sorted_t},
+        "groups": grouped_n,
+    }
+
+
+@app.get("/schedule/week")
+def get_schedule_week(
+    expand: bool = Query(False, description="Return full payloads if true"),
+) -> dict:
+    """All recurring items grouped by weekday (Monday-first)."""
+    recurring = list_items(item_type="recurring")
+    by_wd: dict[str, list[dict]] = defaultdict(list)
+    for r in recurring:
+        w = r.get("weekday")
+        if not isinstance(w, str) or not w.strip():
+            continue
+        key = w.strip().title()
+        by_wd[key].append(r)
+    ordered = sorted(by_wd.keys(), key=lambda n: _WEEKDAY_ORDER.get(n.lower(), 99))
+    return {
+        "by_weekday": {
+            wd: finalize_api_list(by_wd[wd], expand) for wd in ordered
+        }
+    }
+
+
+@app.get("/events")
+def get_events(
+    source: str | None = Query(None, description="Filter by crawler source"),
+    expand: bool = Query(False, description="Return full payloads if true"),
+) -> list[dict]:
+    src = source.strip() if source else None
+    if src == "user":
+        return finalize_api_list(list_user_event_payloads_for_public(), expand)
+    rows = list_events(source=src or None)
+    if src:
+        return finalize_api_list(rows, expand)
+    return finalize_api_list(rows + list_user_event_payloads_for_public(), expand)
+
+
+@app.get("/home")
+def get_home() -> dict:
+    items = finalize_api_list(_upcoming_event_payloads(), False)[:_HOME_EVENTS_LIMIT]
+    return {
+        "sections": [
+            {
+                "type": "events",
+                "title": "What's Happening",
+                "items": items,
+            }
+        ]
+    }
+
+
+@app.get("/events/upcoming")
+def get_events_upcoming(
+    expand: bool = Query(False, description="Return full payloads if true"),
+) -> list[dict]:
+    return finalize_api_list(_upcoming_event_payloads(), expand)
+
+
+@app.get("/events/today")
+def get_events_today(
+    expand: bool = Query(False, description="Return full payloads if true"),
+) -> list[dict]:
+    today = date.today()
+    out: list[dict] = []
+    for e in _all_events():
+        start, end = _event_date_span(e)
+        if start is None or end is None:
+            continue
+        if start <= today <= end:
+            out.append(e)
+    return finalize_api_list(out, expand)
+
+
+@app.get("/events/weekend")
+def get_events_weekend(
+    expand: bool = Query(False, description="Return full payloads if true"),
+) -> list[dict]:
+    today = date.today()
+    fri, sun = _upcoming_weekend_bounds(today)
+    picked: list[dict] = []
+    for e in _all_events():
+        start, end = _event_date_span(e)
+        if start is None or end is None:
+            continue
+        if end < fri or start > sun:
+            continue
+        picked.append(e)
+    return finalize_api_list(picked, expand)
+
+
+@app.get("/events/with-location")
+def get_events_with_location(
+    expand: bool = Query(False, description="Return full payloads if true"),
+) -> list[dict]:
+    rows = [e for e in _all_events() if e.get("has_location") is True]
+    return finalize_api_list(rows, expand)
+
+
+@app.get("/events/sources")
+def get_event_sources_summary() -> dict[str, int]:
+    return count_events_by_source()
+
+
+@app.get("/events/summary")
+def get_events_summary() -> dict:
+    events = _all_events()
+    total = len(events)
+    with_dates = sum(1 for e in events if _parse_iso_date(e.get("start_date")) is not None)
+    with_location = sum(1 for e in events if e.get("has_location") is True)
+    with_time = sum(1 for e in events if e.get("has_time") is True)
+    return {
+        "total": total,
+        "with_dates": with_dates,
+        "with_location": with_location,
+        "with_time": with_time,
+    }
+

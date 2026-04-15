@@ -1,0 +1,12 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+havasu.db
+
+havasu-events-frontend/node_modules/
+havasu-events-frontend/.next/
+
+web/node_modules/
+web/.next/
