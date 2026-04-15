@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import re
+import hashlib
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -85,9 +86,24 @@ LIMIT_MIN = 1
 LIMIT_MAX = 200
 TRACK_DEDUP_WINDOW_SEC_VIEW = 600.0
 TRACK_DEDUP_WINDOW_SEC_CLICK = 600.0
+WEIGHTS = {
+    "click": 1.0,
+    "popularity": 0.5,
+    "recency": 0.3,
+    "semantic": 0.8,
+}
+TOTAL_BOOST_CAP = 1.5
+TEST_QUERIES = [
+    "kids sports",
+    "live music",
+    "nightlife",
+    "family events",
+    "free events",
+]
 
 logger = logging.getLogger(__name__)
 _track_seen: dict[str, float] = {}
+_embedding_cache: dict[str, list[float]] = {}
 
 
 class SearchAISection(BaseModel):
@@ -488,15 +504,17 @@ def has_openai_key() -> bool:
     return bool(key and key.startswith("sk-"))
 
 
-def get_embedding(text: str) -> list[float] | None:
+def get_embedding(text: str, *, cache_key: str | None = None) -> list[float] | None:
     value = (text or "").strip()
     if not value or OpenAI is None:
         return None
+    if cache_key:
+        cached = _embedding_cache.get(cache_key)
+        if isinstance(cached, list) and cached:
+            return cached
     if not has_openai_key():
-        print("⚠️ OPENAI_API_KEY not set — embeddings disabled")
         return None
     try:
-        print("✅ Using OpenAI embeddings")
         api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
         client = OpenAI(api_key=api_key)
         resp = client.embeddings.create(
@@ -507,7 +525,11 @@ def get_embedding(text: str) -> list[float] | None:
         if not data:
             return None
         emb = getattr(data[0], "embedding", None)
-        return emb if isinstance(emb, list) and emb else None
+        if isinstance(emb, list) and emb:
+            if cache_key:
+                _embedding_cache[cache_key] = emb
+            return emb
+        return None
     except Exception:
         return None
 
@@ -522,7 +544,7 @@ def _embedding_debug_reason() -> str:
         client = OpenAI(api_key=api_key)
         resp = client.embeddings.create(
             model="text-embedding-3-small",
-            input="ai-status-check",
+            input="test",
         )
         data = getattr(resp, "data", None)
         if data and getattr(data[0], "embedding", None):
@@ -530,13 +552,14 @@ def _embedding_debug_reason() -> str:
         return "empty_embedding_response"
     except Exception as exc:
         text = str(exc).lower()
+        short = str(exc).strip().replace("\n", " ")[:180]
         if "429" in text or "quota" in text or "rate limit" in text:
-            return "rate_limit_or_quota"
+            return f"rate_limit_or_quota: {short}"
         if "401" in text or "invalid api key" in text or "incorrect api key" in text:
-            return "auth_error"
+            return f"auth_error: {short}"
         if "timeout" in text:
-            return "timeout"
-        return f"error:{type(exc).__name__}"
+            return f"timeout: {short}"
+        return f"error:{type(exc).__name__}: {short}"
 
 
 def cosine_similarity(a: list[float] | None, b: list[float] | None) -> float:
@@ -553,6 +576,21 @@ def cosine_similarity(a: list[float] | None, b: list[float] | None) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _normalize_signal(value: float, max_value: float) -> float:
+    if max_value <= 0:
+        return 0.0
+    return max(0.0, min(1.0, value / max_value))
+
+
+def _recency_signal(start_raw: str, now: datetime) -> float:
+    start_dt = _parse_start_datetime(start_raw)
+    if start_dt is None or start_dt < now:
+        return 0.0
+    # Decay over a 72-hour window; near-term events get strongest recency signal.
+    hours_until = (start_dt - now).total_seconds() / 3600.0
+    return max(0.0, min(1.0, 1.0 - (hours_until / 72.0)))
+
+
 def _parse_start_datetime(value: str) -> datetime | None:
     raw = (value or "").strip()
     if not raw:
@@ -566,15 +604,20 @@ def _parse_start_datetime(value: str) -> datetime | None:
     return dt
 
 
-def apply_behavior_boosts(
+def apply_weighted_rank_boosts(
     query: str,
     items: list[dict[str, Any]],
     *,
     start_lookup: dict[str, str],
+    event_text_lookup: dict[str, str],
 ) -> list[dict[str, Any]]:
     clicked_map = get_ai_clicked_weights(query)
     click_counts = get_event_click_counts()
     now = datetime.utcnow()
+    max_click_signal = max(clicked_map.values()) if clicked_map else 0.0
+    max_popularity = float(max(click_counts.values())) if click_counts else 0.0
+    query_key = f"q:{query.strip().lower()}"
+    query_embedding = get_embedding(query, cache_key=query_key)
     boosted: list[dict[str, Any]] = []
     for item in items:
         row = dict(item)
@@ -584,49 +627,31 @@ def apply_behavior_boosts(
         except (TypeError, ValueError):
             base_score = 0.0
 
-        added = 0.0
-        if rid in clicked_map:
-            added += min(0.3, float(clicked_map[rid]) * 0.1)
+        click_signal = _normalize_signal(float(clicked_map.get(rid, 0.0)), max_click_signal)
+        popularity_signal = _normalize_signal(float(click_counts.get(rid, 0)), max_popularity)
+        recency_signal = _recency_signal(start_lookup.get(rid, ""), now)
 
-        count = int(click_counts.get(rid, 0))
-        if count > 0:
-            added += min(0.25, count * 0.02)
+        semantic_signal = 0.0
+        text = event_text_lookup.get(rid, "")
+        if query_embedding and text:
+            event_key = f"e:{rid}" if rid else f"e:{hashlib.sha1(text.encode('utf-8', errors='ignore')).hexdigest()}"
+            event_embedding = get_embedding(text, cache_key=event_key)
+            semantic_signal = max(0.0, min(1.0, cosine_similarity(query_embedding, event_embedding)))
 
-        start_dt = _parse_start_datetime(start_lookup.get(rid, ""))
-        if start_dt is not None and start_dt >= now:
-            hours_until = (start_dt - now).total_seconds() / 3600.0
-            recency_boost = max(0.0, 0.2 - (hours_until * 0.01))
-            added += recency_boost
+        click_component = click_signal * float(WEIGHTS["click"])
+        popularity_component = popularity_signal * float(WEIGHTS["popularity"])
+        recency_component = recency_signal * float(WEIGHTS["recency"])
+        semantic_component = semantic_signal * float(WEIGHTS["semantic"])
+        added = click_component + popularity_component + recency_component + semantic_component
 
-        row["score"] = base_score + min(0.5, added)
-        boosted.append(row)
-    return boosted
-
-
-def apply_semantic_boost(
-    query: str,
-    items: list[dict[str, Any]],
-    *,
-    event_text_lookup: dict[str, str],
-) -> list[dict[str, Any]]:
-    if not items:
-        return items
-    query_embedding = get_embedding(query)
-    if not query_embedding:
-        return items
-    boosted: list[dict[str, Any]] = []
-    for idx, item in enumerate(items):
-        row = dict(item)
-        if idx < 30:
-            rid = str(row.get("id") or "").strip()
-            text = event_text_lookup.get(rid, "")
-            event_embedding = get_embedding(text)
-            sim = cosine_similarity(query_embedding, event_embedding)
-            semantic_boost = min(0.3, max(0.0, sim * 0.3))
-            try:
-                row["score"] = float(row.get("score") or 0.0) + semantic_boost
-            except (TypeError, ValueError):
-                row["score"] = semantic_boost
+        row["score"] = base_score + min(TOTAL_BOOST_CAP, added)
+        row["_score_components"] = {
+            "base": round(base_score, 6),
+            "click": round(click_component, 6),
+            "popularity": round(popularity_component, 6),
+            "recency": round(recency_component, 6),
+            "semantic": round(semantic_component, 6),
+        }
         boosted.append(row)
     return boosted
 
@@ -737,8 +762,24 @@ def discover() -> DiscoverResponse:
     return DiscoverResponse(today=today_rows, weekend=weekend_rows, popular=popular_rows)
 
 
-@app.post("/ai/recommend", response_model=list[AIRecommendation])
-def ai_recommend(body: AIRecommendRequest) -> list[AIRecommendation]:
+def _build_debug_breakdown(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows[:5]:
+        rid = str(row.get("id") or "").strip()
+        if not rid:
+            continue
+        out.append(
+            {
+                "id": rid,
+                "final_score": float(row.get("score") or 0.0),
+                "components": row.get("_score_components") or {},
+            }
+        )
+    return out
+
+
+@app.post("/ai/recommend")
+def ai_recommend(body: AIRecommendRequest, debug: bool = Query(False)) -> list[AIRecommendation] | dict[str, Any]:
     query = body.query.strip()
     events = _events_for_ai_context(limit=75)
     payload = _format_for_ai(events)
@@ -754,21 +795,27 @@ def ai_recommend(body: AIRecommendRequest) -> list[AIRecommendation]:
 
     # Local deterministic fallback always available.
     fallback_ranked = _local_ai_rank(query, payload)
-    fallback_ranked = apply_behavior_boosts(query, fallback_ranked, start_lookup=start_lookup)
-    fallback_ranked = apply_semantic_boost(
+    fallback_ranked = apply_weighted_rank_boosts(
         query,
         fallback_ranked,
+        start_lookup=start_lookup,
         event_text_lookup=event_text_lookup,
     )
     fallback_ranked.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
     fallback_ranked = fallback_ranked[:5]
 
     if not has_openai_key() or OpenAI is None:
-        final = [AIRecommendation(**r) for r in fallback_ranked]
+        final = [AIRecommendation(id=str(r.get("id") or ""), score=float(r.get("score") or 0.0), reason=str(r.get("reason") or "Relevant match")) for r in fallback_ranked if str(r.get("id") or "").strip()]
         try:
             log_ai_interaction(query, [x.id for x in final])
         except Exception:
             pass
+        if debug:
+            return {
+                "results": [x.model_dump() for x in final],
+                "breakdown": _build_debug_breakdown(fallback_ranked),
+                "weights": WEIGHTS,
+            }
         return final
 
     try:
@@ -802,10 +849,10 @@ def ai_recommend(body: AIRecommendRequest) -> list[AIRecommendation]:
             clean.append(AIRecommendation(id=rid, score=max(0.0, min(1.0, score)), reason=reason))
         if clean:
             boosted_input = [{"id": x.id, "score": x.score, "reason": x.reason} for x in clean]
-            boosted = apply_behavior_boosts(query, boosted_input, start_lookup=start_lookup)
-            boosted = apply_semantic_boost(
+            boosted = apply_weighted_rank_boosts(
                 query,
-                boosted,
+                boosted_input,
+                start_lookup=start_lookup,
                 event_text_lookup=event_text_lookup,
             )
             boosted.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
@@ -823,15 +870,35 @@ def ai_recommend(body: AIRecommendRequest) -> list[AIRecommendation]:
                     log_ai_interaction(query, [x.id for x in final])
                 except Exception:
                     pass
+                if debug:
+                    return {
+                        "results": [x.model_dump() for x in final],
+                        "breakdown": _build_debug_breakdown(boosted),
+                        "weights": WEIGHTS,
+                    }
                 return final
     except Exception as exc:
         logger.warning("ai_recommend fallback due to error: %s", exc)
 
-    final = [AIRecommendation(**r) for r in fallback_ranked]
+    final = [
+        AIRecommendation(
+            id=str(r.get("id") or ""),
+            score=float(r.get("score") or 0.0),
+            reason=str(r.get("reason") or "Relevant match"),
+        )
+        for r in fallback_ranked
+        if str(r.get("id") or "").strip()
+    ]
     try:
         log_ai_interaction(query, [x.id for x in final])
     except Exception:
         pass
+    if debug:
+        return {
+            "results": [x.model_dump() for x in final],
+            "breakdown": _build_debug_breakdown(fallback_ranked),
+            "weights": WEIGHTS,
+        }
     return final
 
 
@@ -852,7 +919,25 @@ def debug_ai_status() -> dict[str, Any]:
     if has_key:
         reason = _embedding_debug_reason()
         embeddings_active = reason == "ok"
-    return {"has_key": has_key, "embeddings_active": embeddings_active, "reason": reason}
+    query_cache_count = sum(1 for k in _embedding_cache if k.startswith("q:"))
+    event_cache_count = sum(1 for k in _embedding_cache if k.startswith("e:"))
+    return {
+        "has_key": has_key,
+        "embeddings_active": embeddings_active,
+        "reason": reason,
+        "cache_size": len(_embedding_cache),
+        "query_cache_count": query_cache_count,
+        "event_cache_count": event_cache_count,
+    }
+
+
+@app.get("/debug/ai-weight-check")
+def debug_ai_weight_check() -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    for query in TEST_QUERIES:
+        payload = ai_recommend(AIRecommendRequest(query=query), debug=True)
+        results[query] = payload
+    return {"weights": WEIGHTS, "queries": TEST_QUERIES, "results": results}
 
 
 @app.post("/submit", response_model=SubmitResponse)
