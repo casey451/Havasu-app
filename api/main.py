@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
+import math
 import os
 import re
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from typing import Any
 
@@ -14,6 +16,15 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+try:
+    from openai import OpenAI
+except Exception:  # pragma: no cover - optional runtime dependency
+    OpenAI = None
 
 from api.rate_limit import RateLimitMiddleware
 from api.routers import admin_routes, auth, business_routes
@@ -40,12 +51,17 @@ from db.accounts import (
 from db.activities import (
     ActivityInput,
     SlotInput,
+    build_event_embedding_text,
     delete_activity,
+    get_event_click_counts,
+    get_ai_clicked_weights,
     increment_activity_click,
     increment_activity_view,
     ingest_activity,
     list_expanded_slot_payloads,
     list_pending_activities,
+    log_ai_interaction,
+    record_ai_click,
     set_activity_status,
 )
 from db.database import count_events_by_source, get_item_payload_by_id, init_db, list_events, list_items
@@ -140,6 +156,21 @@ class NotificationFeedItem(BaseModel):
 
 class NotificationFeedResponse(BaseModel):
     items: list[NotificationFeedItem] = Field(default_factory=list)
+
+
+class AIRecommendRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+
+
+class AIRecommendation(BaseModel):
+    id: str
+    score: float
+    reason: str
+
+
+class AIClickRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    clicked_id: str = Field(..., min_length=1)
 
 
 def _sanitize_ai_suggestions(value: Any) -> list[str]:
@@ -350,6 +381,256 @@ def _is_junk_title(title: str) -> bool:
     return False
 
 
+def _events_for_ai_context(*, limit: int = 75) -> list[dict[str, Any]]:
+    rows = _combined_read_rows(None, None) + list_expanded_slot_payloads()
+    normalized = finalize_api_list(rows if isinstance(rows, list) else [], False)
+    candidates = [r for r in normalized if str(r.get("id") or "").strip()]
+
+    # Keep context reasonably fresh/time-aware before handing to model.
+    def key(row: dict[str, Any]) -> tuple[int, str]:
+        sd = str(row.get("start_date") or "")
+        has_date = 0 if sd else 1
+        return (has_date, sd)
+
+    candidates.sort(key=key)
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in candidates:
+        rid = str(row.get("id") or "").strip()
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        deduped.append(row)
+        if len(deduped) >= max(1, limit):
+            break
+    return deduped
+
+
+def _format_for_ai(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for e in events[:75]:
+        out.append(
+            {
+                "id": str(e.get("id") or ""),
+                "title": str(e.get("title") or ""),
+                "description": str(e.get("description") or ""),
+                "category": str(e.get("category") or ""),
+                "tags": e.get("tags") if isinstance(e.get("tags"), list) else [],
+                "start": str(e.get("start_date") or ""),
+                "end": str(e.get("end_date") or ""),
+                "location": str(e.get("location") or e.get("location_label") or ""),
+                "is_active_now": bool(e.get("is_active_now") or False),
+            }
+        )
+    return out
+
+
+def _local_ai_rank(query: str, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tokens = [t for t in re.split(r"[^a-z0-9]+", query.lower().strip()) if t]
+    requires_now = any(t in {"now", "open", "live"} for t in tokens)
+    out: list[dict[str, Any]] = []
+    for e in events:
+        score = 0.0
+        cat = str(e.get("category") or "").lower()
+        tags = [str(t).lower() for t in (e.get("tags") or []) if isinstance(t, str)]
+        title = str(e.get("title") or "").lower()
+        active = bool(e.get("is_active_now"))
+        if active:
+            score += 0.5
+        if requires_now and active:
+            score += 0.4
+        tag_hits = sum(1 for t in tokens if t in tags)
+        score += min(0.3, 0.08 * tag_hits)
+        if any(t == cat for t in tokens):
+            score += 0.2
+        if any(t and t in title for t in tokens):
+            score += 0.1
+        if requires_now and not active:
+            score -= 0.1
+        if score <= 0:
+            continue
+        reason_parts: list[str] = []
+        if active:
+            reason_parts.append("happening now")
+        if tag_hits > 0:
+            reason_parts.append(f"matches {tag_hits} tag(s)")
+        if any(t == cat for t in tokens):
+            reason_parts.append(f"fits {cat}")
+        reason = ", ".join(reason_parts) if reason_parts else "relevant match"
+        out.append({"id": str(e.get("id") or ""), "score": float(min(1.0, max(0.0, score))), "reason": reason})
+    out.sort(key=lambda r: r["score"], reverse=True)
+    return out[:5]
+
+
+def _parse_ai_response_json(text: str) -> list[dict[str, Any]]:
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [p for p in parsed if isinstance(p, dict)]
+    except json.JSONDecodeError:
+        # Try to extract a JSON array if model wrapped it in prose/fences.
+        m = re.search(r"\[.*\]", raw, flags=re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+                if isinstance(parsed, list):
+                    return [p for p in parsed if isinstance(p, dict)]
+            except json.JSONDecodeError:
+                return []
+    return []
+
+
+def has_openai_key() -> bool:
+    key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    return bool(key and key.startswith("sk-"))
+
+
+def get_embedding(text: str) -> list[float] | None:
+    value = (text or "").strip()
+    if not value or OpenAI is None:
+        return None
+    if not has_openai_key():
+        print("⚠️ OPENAI_API_KEY not set — embeddings disabled")
+        return None
+    try:
+        print("✅ Using OpenAI embeddings")
+        api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        client = OpenAI(api_key=api_key)
+        resp = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=value,
+        )
+        data = getattr(resp, "data", None)
+        if not data:
+            return None
+        emb = getattr(data[0], "embedding", None)
+        return emb if isinstance(emb, list) and emb else None
+    except Exception:
+        return None
+
+
+def _embedding_debug_reason() -> str:
+    if OpenAI is None:
+        return "openai_package_missing"
+    if not has_openai_key():
+        return "missing_openai_key"
+    try:
+        api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        client = OpenAI(api_key=api_key)
+        resp = client.embeddings.create(
+            model="text-embedding-3-small",
+            input="ai-status-check",
+        )
+        data = getattr(resp, "data", None)
+        if data and getattr(data[0], "embedding", None):
+            return "ok"
+        return "empty_embedding_response"
+    except Exception as exc:
+        text = str(exc).lower()
+        if "429" in text or "quota" in text or "rate limit" in text:
+            return "rate_limit_or_quota"
+        if "401" in text or "invalid api key" in text or "incorrect api key" in text:
+            return "auth_error"
+        if "timeout" in text:
+            return "timeout"
+        return f"error:{type(exc).__name__}"
+
+
+def cosine_similarity(a: list[float] | None, b: list[float] | None) -> float:
+    if not a or not b:
+        return 0.0
+    size = min(len(a), len(b))
+    if size <= 0:
+        return 0.0
+    dot = sum(float(a[i]) * float(b[i]) for i in range(size))
+    norm_a = math.sqrt(sum(float(a[i]) * float(a[i]) for i in range(size)))
+    norm_b = math.sqrt(sum(float(b[i]) * float(b[i]) for i in range(size)))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _parse_start_datetime(value: str) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def apply_behavior_boosts(
+    query: str,
+    items: list[dict[str, Any]],
+    *,
+    start_lookup: dict[str, str],
+) -> list[dict[str, Any]]:
+    clicked_map = get_ai_clicked_weights(query)
+    click_counts = get_event_click_counts()
+    now = datetime.utcnow()
+    boosted: list[dict[str, Any]] = []
+    for item in items:
+        row = dict(item)
+        rid = str(row.get("id") or "").strip()
+        try:
+            base_score = float(row.get("score") or 0.0)
+        except (TypeError, ValueError):
+            base_score = 0.0
+
+        added = 0.0
+        if rid in clicked_map:
+            added += min(0.3, float(clicked_map[rid]) * 0.1)
+
+        count = int(click_counts.get(rid, 0))
+        if count > 0:
+            added += min(0.25, count * 0.02)
+
+        start_dt = _parse_start_datetime(start_lookup.get(rid, ""))
+        if start_dt is not None and start_dt >= now:
+            hours_until = (start_dt - now).total_seconds() / 3600.0
+            recency_boost = max(0.0, 0.2 - (hours_until * 0.01))
+            added += recency_boost
+
+        row["score"] = base_score + min(0.5, added)
+        boosted.append(row)
+    return boosted
+
+
+def apply_semantic_boost(
+    query: str,
+    items: list[dict[str, Any]],
+    *,
+    event_text_lookup: dict[str, str],
+) -> list[dict[str, Any]]:
+    if not items:
+        return items
+    query_embedding = get_embedding(query)
+    if not query_embedding:
+        return items
+    boosted: list[dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        row = dict(item)
+        if idx < 30:
+            rid = str(row.get("id") or "").strip()
+            text = event_text_lookup.get(rid, "")
+            event_embedding = get_embedding(text)
+            sim = cosine_similarity(query_embedding, event_embedding)
+            semantic_boost = min(0.3, max(0.0, sim * 0.3))
+            try:
+                row["score"] = float(row.get("score") or 0.0) + semantic_boost
+            except (TypeError, ValueError):
+                row["score"] = semantic_boost
+        boosted.append(row)
+    return boosted
+
+
 @app.get("/items")
 def get_items(
     item_type: str | None = Query(
@@ -454,6 +735,124 @@ def discover() -> DiscoverResponse:
     weekend_rows = get_weekend(normalized)
     popular_rows = get_popular(normalized)
     return DiscoverResponse(today=today_rows, weekend=weekend_rows, popular=popular_rows)
+
+
+@app.post("/ai/recommend", response_model=list[AIRecommendation])
+def ai_recommend(body: AIRecommendRequest) -> list[AIRecommendation]:
+    query = body.query.strip()
+    events = _events_for_ai_context(limit=75)
+    payload = _format_for_ai(events)
+    if not payload:
+        return []
+    start_lookup = {str(e.get("id") or "").strip(): str(e.get("start") or "") for e in payload}
+    event_text_lookup = {
+        str(e.get("id") or "").strip(): build_event_embedding_text(e)
+        for e in payload
+        if str(e.get("id") or "").strip()
+    }
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+
+    # Local deterministic fallback always available.
+    fallback_ranked = _local_ai_rank(query, payload)
+    fallback_ranked = apply_behavior_boosts(query, fallback_ranked, start_lookup=start_lookup)
+    fallback_ranked = apply_semantic_boost(
+        query,
+        fallback_ranked,
+        event_text_lookup=event_text_lookup,
+    )
+    fallback_ranked.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+    fallback_ranked = fallback_ranked[:5]
+
+    if not has_openai_key() or OpenAI is None:
+        final = [AIRecommendation(**r) for r in fallback_ranked]
+        try:
+            log_ai_interaction(query, [x.id for x in final])
+        except Exception:
+            pass
+        return final
+
+    try:
+        client = OpenAI(api_key=api_key)
+        prompt = (
+            "You are a recommendation engine.\n"
+            f"User query: {query}\n"
+            f"Events: {json.dumps(payload, ensure_ascii=True)}\n\n"
+            "Return ONLY a JSON array of up to 5 objects with keys:\n"
+            "id (string), score (0..1 float), reason (short string).\n"
+            "Only use IDs that exist in the provided events."
+        )
+        resp = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        parsed = _parse_ai_response_json(text)
+        allowed_ids = {str(e["id"]) for e in payload if str(e.get("id") or "").strip()}
+        clean: list[AIRecommendation] = []
+        for r in parsed:
+            rid = str(r.get("id") or "").strip()
+            if not rid or rid not in allowed_ids:
+                continue
+            try:
+                score = float(r.get("score") or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+            reason = str(r.get("reason") or "Relevant match").strip() or "Relevant match"
+            clean.append(AIRecommendation(id=rid, score=max(0.0, min(1.0, score)), reason=reason))
+        if clean:
+            boosted_input = [{"id": x.id, "score": x.score, "reason": x.reason} for x in clean]
+            boosted = apply_behavior_boosts(query, boosted_input, start_lookup=start_lookup)
+            boosted = apply_semantic_boost(
+                query,
+                boosted,
+                event_text_lookup=event_text_lookup,
+            )
+            boosted.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+            final = [
+                AIRecommendation(
+                    id=str(r.get("id") or ""),
+                    score=float(r.get("score") or 0.0),
+                    reason=str(r.get("reason") or "Relevant match"),
+                )
+                for r in boosted[:5]
+                if str(r.get("id") or "").strip()
+            ]
+            if final:
+                try:
+                    log_ai_interaction(query, [x.id for x in final])
+                except Exception:
+                    pass
+                return final
+    except Exception as exc:
+        logger.warning("ai_recommend fallback due to error: %s", exc)
+
+    final = [AIRecommendation(**r) for r in fallback_ranked]
+    try:
+        log_ai_interaction(query, [x.id for x in final])
+    except Exception:
+        pass
+    return final
+
+
+@app.post("/ai/click")
+def ai_click(body: AIClickRequest) -> dict[str, bool]:
+    try:
+        record_ai_click(body.query, body.clicked_id)
+    except Exception:
+        pass
+    return {"success": True}
+
+
+@app.get("/debug/ai-status")
+def debug_ai_status() -> dict[str, Any]:
+    has_key = has_openai_key() and OpenAI is not None
+    embeddings_active = False
+    reason = "missing_openai_key_or_package"
+    if has_key:
+        reason = _embedding_debug_reason()
+        embeddings_active = reason == "ok"
+    return {"has_key": has_key, "embeddings_active": embeddings_active, "reason": reason}
 
 
 @app.post("/submit", response_model=SubmitResponse)

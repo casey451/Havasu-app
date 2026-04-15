@@ -23,6 +23,12 @@ export type DiscoverResponse = {
   popular: EventItem[];
 };
 
+export type AIRecommendation = {
+  id: string;
+  score: number;
+  reason: string;
+};
+
 export async function getDiscover(): Promise<DiscoverResponse> {
   const res = await fetch(`${BASE_URL}/discover`, { cache: "no-store" });
   if (!res.ok) throw new Error(await readApiError(res));
@@ -71,6 +77,25 @@ export async function submitActivity(data: {
   });
   if (!res.ok) throw new Error(await readApiError(res));
   return (await res.json()) as { success: boolean; duplicate?: boolean; id?: string };
+}
+
+export async function aiRecommend(query: string): Promise<AIRecommendation[]> {
+  const res = await fetch(`${BASE_URL}/ai/recommend`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+  });
+  if (!res.ok) throw new Error(await readApiError(res));
+  return (await res.json()) as AIRecommendation[];
+}
+
+export async function aiClick(query: string, clicked_id: string): Promise<void> {
+  if (!query.trim() || !clicked_id.trim()) return;
+  await fetch(`${BASE_URL}/ai/click`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, clicked_id }),
+  });
 }
 
 export async function trackView(id: string): Promise<void> {

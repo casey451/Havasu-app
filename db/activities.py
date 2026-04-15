@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import uuid
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
@@ -341,6 +343,145 @@ def delete_activity(activity_id: str) -> bool:
             return cur.rowcount > 0
         except sqlite3.OperationalError:
             return False
+
+
+def _normalize_ai_query(value: str) -> str:
+    # Keep normalization stable so click learning compares equivalent queries.
+    q = (value or "").lower().strip()
+    q = re.sub(r"[^a-z0-9\s]+", " ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+
+def tokenize(text: str) -> list[str]:
+    q = _normalize_ai_query(text)
+    if not q:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for token in q.split(" "):
+        if len(token) < 3 or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def log_ai_interaction(query: str, returned_ids: list[str]) -> str:
+    interaction_id = f"ai-{uuid.uuid4().hex[:16]}"
+    q = _normalize_ai_query(query)
+    if not q:
+        return ""
+    ids = [str(i).strip() for i in returned_ids if str(i).strip()]
+    with get_connection() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO ai_interactions (id, query, returned_ids, clicked_id)
+                VALUES (?, ?, ?, NULL)
+                """,
+                (interaction_id, q, json.dumps(ids, ensure_ascii=True)),
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            return ""
+    return interaction_id
+
+
+def record_ai_click(query: str, clicked_id: str) -> bool:
+    q = _normalize_ai_query(query)
+    cid = (clicked_id or "").strip()
+    if not q or not cid:
+        return False
+    with get_connection() as conn:
+        try:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM ai_interactions
+                WHERE query = ? AND clicked_id IS NULL
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT 1
+                """,
+                (q,),
+            ).fetchone()
+            if row is None:
+                return False
+            cur = conn.execute(
+                "UPDATE ai_interactions SET clicked_id = ? WHERE id = ?",
+                (cid, str(row["id"])),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        except sqlite3.OperationalError:
+            return False
+
+
+def get_ai_clicked_weights(query: str) -> dict[str, float]:
+    q_tokens = tokenize(query)
+    if not q_tokens:
+        return {}
+    q_set = set(q_tokens)
+    with get_connection() as conn:
+        try:
+            rows = conn.execute(
+                """
+                SELECT clicked_id, query
+                FROM ai_interactions
+                WHERE clicked_id IS NOT NULL
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT 500
+                """,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+    out: dict[str, float] = {}
+    for r in rows:
+        cid = str(r["clicked_id"] or "").strip()
+        if not cid:
+            continue
+        past_tokens = tokenize(str(r["query"] or ""))
+        if not past_tokens:
+            continue
+        overlap = len(q_set.intersection(set(past_tokens)))
+        if overlap <= 0:
+            continue
+        match_weight = overlap / float(len(q_tokens))
+        out[cid] = out.get(cid, 0.0) + match_weight
+    return out
+
+
+def get_event_click_counts() -> dict[str, int]:
+    with get_connection() as conn:
+        try:
+            rows = conn.execute(
+                """
+                SELECT clicked_id, COUNT(*) AS c
+                FROM ai_interactions
+                WHERE clicked_id IS NOT NULL
+                GROUP BY clicked_id
+                ORDER BY c DESC
+                LIMIT 1000
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+    out: dict[str, int] = {}
+    for r in rows:
+        cid = str(r["clicked_id"] or "").strip()
+        if not cid:
+            continue
+        out[cid] = int(r["c"] or 0)
+    return out
+
+
+def build_event_embedding_text(event: dict[str, Any]) -> str:
+    title = str(event.get("title") or "").strip()
+    description = str(event.get("description") or "").strip()
+    category = str(event.get("category") or "").strip()
+    tags = event.get("tags") if isinstance(event.get("tags"), list) else []
+    tags_text = " ".join(str(t).strip() for t in tags if str(t).strip())
+    return " ".join(part for part in [title, description, category, tags_text] if part).strip()
 
 
 def _expand_slot_dates(

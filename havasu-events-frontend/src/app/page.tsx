@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { getDiscover, trackClick, trackView, type EventItem } from "@/lib/api";
+import { aiClick, aiRecommend, getDiscover, trackClick, trackView, type EventItem } from "@/lib/api";
 
 type TimelineItem = EventItem & {
   startDate: Date;
@@ -134,6 +134,9 @@ export default function Home() {
   const [view, setView] = useState<ViewMode>("today");
   const [activeFilter, setActiveFilter] = useState<FilterOption>("all");
   const [query, setQuery] = useState("");
+  const [aiScores, setAiScores] = useState<Record<string, number>>({});
+  const [aiReasons, setAiReasons] = useState<Record<string, string>>({});
+  const [aiLoading, setAiLoading] = useState(false);
   const viewed = useRef<Set<string>>(new Set());
 
   useEffect(() => {
@@ -193,9 +196,57 @@ export default function Home() {
     });
   }, [activeFilter, preparedRows, query]);
 
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (!trimmed) {
+      setAiScores({});
+      setAiReasons({});
+      setAiLoading(false);
+      return;
+    }
+    let active = true;
+    setAiLoading(true);
+    void aiRecommend(trimmed)
+      .then((recs) => {
+        if (!active) return;
+        const scoreMap: Record<string, number> = {};
+        const reasonMap: Record<string, string> = {};
+        for (const r of recs) {
+          const id = String(r.id || "").trim();
+          if (!id) continue;
+          scoreMap[id] = Number(r.score || 0);
+          reasonMap[id] = String(r.reason || "");
+        }
+        setAiScores(scoreMap);
+        setAiReasons(reasonMap);
+      })
+      .catch(() => {
+        if (!active) return;
+        setAiScores({});
+        setAiReasons({});
+      })
+      .finally(() => {
+        if (active) setAiLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [query]);
+
+  const rankedRows = useMemo(() => {
+    const hasAi = Object.keys(aiScores).length > 0;
+    if (!query.trim() || !hasAi) return filteredRows;
+    return [...filteredRows].sort((a, b) => {
+      const as = aiScores[(a.id || "").trim()] ?? -1;
+      const bs = aiScores[(b.id || "").trim()] ?? -1;
+      if (as !== bs) return bs - as;
+      return a.startDate.getTime() - b.startDate.getTime();
+    });
+  }, [aiScores, filteredRows, query]);
+
   const timelineGroups = useMemo(() => {
     const now = new Date();
-    const todayRows = filteredRows.filter((item) => item.startDate.toDateString() === now.toDateString());
+    const todayRows = rankedRows.filter((item) => item.startDate.toDateString() === now.toDateString());
     todayRows.sort((a, b) => {
       if (a.isActiveNow !== b.isActiveNow) return a.isActiveNow ? -1 : 1;
       return a.startDate.getTime() - b.startDate.getTime();
@@ -215,16 +266,20 @@ export default function Home() {
       hourLabel,
       items: groupedItems,
     }));
-  }, [filteredRows]);
+  }, [rankedRows]);
 
   const topPicks = useMemo(() => {
     const now = new Date();
     const signals = parseQuerySignals(query);
-    const todaysItems = filteredRows.filter((item) => item.startDate.toDateString() === now.toDateString());
+    const todaysItems = rankedRows.filter((item) => item.startDate.toDateString() === now.toDateString());
     return [...todaysItems]
-      .sort((a, b) => recommendationScore(b, signals) - recommendationScore(a, signals))
+      .sort((a, b) => {
+        const aScore = aiScores[(a.id || "").trim()] ?? recommendationScore(a, signals);
+        const bScore = aiScores[(b.id || "").trim()] ?? recommendationScore(b, signals);
+        return bScore - aScore;
+      })
       .slice(0, 3);
-  }, [filteredRows, query]);
+  }, [aiScores, query, rankedRows]);
 
   const weekSections = useMemo(() => {
     const now = new Date();
@@ -233,7 +288,7 @@ export default function Home() {
     const weekKeys = new Set(weekDays.map(toDayKey));
     const itemsByDay: Record<string, TimelineItem[]> = {};
     for (const key of weekKeys) itemsByDay[key] = [];
-    for (const item of filteredRows) {
+    for (const item of rankedRows) {
       const key = toDayKey(item.startDate);
       if (weekKeys.has(key)) itemsByDay[key].push(item);
     }
@@ -248,7 +303,7 @@ export default function Home() {
         items: itemsByDay[key] || [],
       };
     });
-  }, [filteredRows]);
+  }, [rankedRows]);
 
   const visibleItems = useMemo(() => {
     if (view === "today") {
@@ -265,6 +320,18 @@ export default function Home() {
       void trackView(id);
     }
   }, [visibleItems]);
+
+  const handleEventClick = (id: string) => {
+    const cleanId = id.trim();
+    if (!cleanId) return;
+    void trackClick(cleanId);
+    const activeQuery = query.trim();
+    if (activeQuery) {
+      void aiClick(activeQuery, cleanId).catch(() => {
+        // Best-effort feedback signal; keep UI flow uninterrupted.
+      });
+    }
+  };
 
   return (
     <main className="mx-auto w-full max-w-3xl px-4 py-8">
@@ -296,6 +363,7 @@ export default function Home() {
       {query.trim() ? (
         <p className="mt-3 text-sm text-zinc-700">
           Showing results for: <span className="font-medium">{query.trim()}</span>
+          {aiLoading ? <span className="ml-2 text-zinc-500">(refining...)</span> : null}
         </p>
       ) : null}
       <div className="mt-4 inline-flex rounded-md border border-zinc-200 bg-white p-1 text-sm">
@@ -357,7 +425,7 @@ export default function Home() {
                       <button
                         type="button"
                         onClick={() => {
-                          if (id) void trackClick(id);
+                          if (id) handleEventClick(id);
                         }}
                         className="w-full rounded-lg p-5 text-left transition-transform active:scale-[0.99]"
                       >
@@ -376,6 +444,9 @@ export default function Home() {
                         </div>
                         <p className="mt-2 text-sm text-zinc-600">{item.location || "Lake Havasu"}</p>
                         <p className="mt-1 text-sm text-zinc-700">{formatTimeRange(item.startDate, item.endDate)}</p>
+                        {aiReasons[(item.id || "").trim()] ? (
+                          <p className="mt-1 text-xs text-zinc-500">{aiReasons[(item.id || "").trim()]}</p>
+                        ) : null}
                       </button>
                     </li>
                   );
@@ -397,7 +468,7 @@ export default function Home() {
                       <button
                         type="button"
                         onClick={() => {
-                          if (id) void trackClick(id);
+                          if (id) handleEventClick(id);
                         }}
                         className="w-full rounded-lg p-4 text-left transition-transform active:scale-[0.99]"
                       >
@@ -416,6 +487,9 @@ export default function Home() {
                         </div>
                         <p className="mt-2 text-sm text-zinc-600">{item.location || "Lake Havasu"}</p>
                         <p className="mt-1 text-sm text-zinc-700">{formatTimeRange(item.startDate, item.endDate)}</p>
+                        {aiReasons[(item.id || "").trim()] ? (
+                          <p className="mt-1 text-xs text-zinc-500">{aiReasons[(item.id || "").trim()]}</p>
+                        ) : null}
                       </button>
                     </li>
                   );
@@ -458,7 +532,7 @@ export default function Home() {
                           <button
                             type="button"
                             onClick={() => {
-                              if (id) void trackClick(id);
+                              if (id) handleEventClick(id);
                             }}
                             className="w-full rounded-lg p-4 text-left transition-transform active:scale-[0.99]"
                           >
@@ -477,6 +551,9 @@ export default function Home() {
                             </div>
                             <p className="mt-2 text-sm text-zinc-600">{item.location || "Lake Havasu"}</p>
                             <p className="mt-1 text-sm text-zinc-700">{formatTimeRange(item.startDate, item.endDate)}</p>
+                            {aiReasons[(item.id || "").trim()] ? (
+                              <p className="mt-1 text-xs text-zinc-500">{aiReasons[(item.id || "").trim()]}</p>
+                            ) : null}
                           </button>
                         </li>
                       );

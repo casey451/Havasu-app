@@ -157,3 +157,14 @@ CREATE TABLE IF NOT EXISTS time_slots (
 CREATE INDEX IF NOT EXISTS idx_time_slots_activity ON time_slots (activity_id);
 CREATE INDEX IF NOT EXISTS idx_time_slots_date ON time_slots (date);
 CREATE INDEX IF NOT EXISTS idx_time_slots_weekday ON time_slots (day_of_week);
+
+CREATE TABLE IF NOT EXISTS ai_interactions (
+  id TEXT PRIMARY KEY,
+  query TEXT,
+  returned_ids TEXT,
+  clicked_id TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_interactions_query ON ai_interactions (query);
+CREATE INDEX IF NOT EXISTS idx_ai_interactions_clicked_id ON ai_interactions (clicked_id);
