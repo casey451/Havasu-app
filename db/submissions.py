@@ -14,42 +14,58 @@ def create_submission(
     title: str,
     description: str,
     tags: list[str],
+    intent_tags: list[str],
     category: str,
-    start_date: str | None,
-    location: str,
+    event_time: str | None,
+    location: str | None,
+    contact_info: str | None,
 ) -> str:
     sid = f"s-{uuid.uuid4().hex[:16]}"
     now = utc_now_iso()
     tags_json = json.dumps(tags)
+    intent_tags_json = json.dumps(intent_tags)
     with get_connection() as conn:
         conn.execute(
             """
             INSERT INTO user_submissions (
-              id, title, description, tags, category, start_date, location,
+              id, title, description, tags, intent_tags, category, event_time, start_date, location, contact_info,
               source, status, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'user', 'pending', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'user', 'pending', ?, ?)
             """,
-            (sid, title, description, tags_json, category, start_date, location, now, now),
+            (
+                sid,
+                title,
+                description,
+                tags_json,
+                intent_tags_json,
+                category,
+                event_time,
+                event_time,
+                location,
+                contact_info,
+                now,
+                now,
+            ),
         )
         conn.commit()
     return sid
 
 
-def find_duplicate_submission_id(*, normalized_title: str, start_date: str) -> str | None:
-    """Duplicate = same normalized title + same start_date among pending/approved rows."""
+def find_duplicate_submission_id(*, normalized_title: str, event_time: str) -> str | None:
+    """Duplicate = same normalized title + same event_time among pending/approved rows."""
     with get_connection() as conn:
         row = conn.execute(
             """
             SELECT id
             FROM user_submissions
             WHERE lower(trim(title)) = ?
-              AND trim(COALESCE(start_date, '')) = ?
+              AND trim(COALESCE(event_time, COALESCE(start_date, ''))) = ?
               AND status IN ('pending', 'approved')
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            (normalized_title, start_date.strip()),
+            (normalized_title, event_time.strip()),
         ).fetchone()
     if row is None:
         return None
@@ -60,7 +76,7 @@ def list_pending_submissions() -> list[dict[str, Any]]:
     with get_connection() as conn:
         rows = conn.execute(
             """
-            SELECT id, title, description, tags, category, start_date, location, source, status, created_at,
+            SELECT id, title, description, tags, category, event_time, start_date, location, contact_info, source, status, created_at,
                    view_count, click_count
             FROM user_submissions
             WHERE status = 'pending'
@@ -74,6 +90,9 @@ def list_pending_submissions() -> list[dict[str, Any]]:
             d["tags"] = json.loads(str(d.get("tags") or "[]"))
         except json.JSONDecodeError:
             d["tags"] = []
+        # Internal-only metadata; never expose publicly/admin by default.
+        d.pop("intent_tags", None)
+        d["event_time"] = str(d.get("event_time") or d.get("start_date") or "")
         views = int(d.get("view_count") or 0)
         clicks = int(d.get("click_count") or 0)
         d["ctr"] = round((clicks / views), 4) if views > 0 else 0.0
@@ -85,7 +104,7 @@ def list_submissions(status: SubmissionStatus) -> list[dict[str, Any]]:
     with get_connection() as conn:
         rows = conn.execute(
             """
-            SELECT id, title, description, tags, category, start_date, location, source, status, created_at,
+            SELECT id, title, description, tags, category, event_time, start_date, location, contact_info, source, status, created_at,
                    is_featured, featured_until, view_count, click_count
             FROM user_submissions
             WHERE status = ?
@@ -100,6 +119,8 @@ def list_submissions(status: SubmissionStatus) -> list[dict[str, Any]]:
             d["tags"] = json.loads(str(d.get("tags") or "[]"))
         except json.JSONDecodeError:
             d["tags"] = []
+        d.pop("intent_tags", None)
+        d["event_time"] = str(d.get("event_time") or d.get("start_date") or "")
         views = int(d.get("view_count") or 0)
         clicks = int(d.get("click_count") or 0)
         d["ctr"] = round((clicks / views), 4) if views > 0 else 0.0
@@ -129,7 +150,7 @@ def list_approved_submission_payloads() -> list[dict[str, Any]]:
     with get_connection() as conn:
         rows = conn.execute(
             """
-            SELECT id, title, description, tags, category, start_date, location, source, status,
+            SELECT id, title, description, tags, category, event_time, start_date, location, contact_info, source, status,
                    is_featured, featured_until, view_count, click_count
             FROM user_submissions
             WHERE status = 'approved'
@@ -143,8 +164,9 @@ def list_approved_submission_payloads() -> list[dict[str, Any]]:
             tags = json.loads(str(d.get("tags") or "[]"))
         except json.JSONDecodeError:
             tags = []
-        start = str(d.get("start_date") or "")
+        start = str(d.get("event_time") or d.get("start_date") or "")
         payload = {
+            "id": str(d.get("id") or ""),
             "event_ref": str(d.get("id") or ""),
             "title": str(d.get("title") or ""),
             "type": "event",
@@ -166,6 +188,58 @@ def list_approved_submission_payloads() -> list[dict[str, Any]]:
             "click_count": int(d.get("click_count") or 0),
         }
         out.append(payload)
+    return out
+
+
+def list_approved_submission_payloads_for_ai() -> list[dict[str, Any]]:
+    """AI-only payloads include internal intent metadata, never returned by public APIs."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, title, description, tags, intent_tags, category, event_time, start_date, location, source, status,
+                   is_featured, featured_until, view_count, click_count
+            FROM user_submissions
+            WHERE status = 'approved'
+            ORDER BY updated_at DESC
+            """
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        d = dict(row)
+        try:
+            tags = json.loads(str(d.get("tags") or "[]"))
+        except json.JSONDecodeError:
+            tags = []
+        try:
+            intent_tags = json.loads(str(d.get("intent_tags") or "[]"))
+        except json.JSONDecodeError:
+            intent_tags = []
+        start = str(d.get("event_time") or d.get("start_date") or "")
+        out.append(
+            {
+                "id": str(d.get("id") or ""),
+                "event_ref": str(d.get("id") or ""),
+                "title": str(d.get("title") or ""),
+                "type": "event",
+                "start_date": start,
+                "end_date": start,
+                "weekday": "",
+                "start_time": "",
+                "end_time": "",
+                "location_label": str(d.get("location") or ""),
+                "source": "user",
+                "source_url": f"/submit/{d.get('id')}",
+                "description": str(d.get("description") or ""),
+                "tags": tags if isinstance(tags, list) else [],
+                "intent_tags": [str(t).strip() for t in intent_tags if str(t).strip()],
+                "category": str(d.get("category") or ""),
+                "trust_score": 0.8,
+                "is_featured": bool(int(d.get("is_featured") or 0)),
+                "featured_until": str(d.get("featured_until") or ""),
+                "view_count": int(d.get("view_count") or 0),
+                "click_count": int(d.get("click_count") or 0),
+            }
+        )
     return out
 
 

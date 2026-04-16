@@ -390,13 +390,75 @@ def _migrate_business_profiles(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_user_submissions_featured(conn: sqlite3.Connection) -> None:
-    """Add featured controls to user_submissions for promoted listings."""
+    """Keep user_submissions schema backward compatible and extensible."""
     try:
         cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(user_submissions)")}
     except sqlite3.OperationalError:
         return
     if not cols:
         return
+    table_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'user_submissions'"
+    ).fetchone()
+    table_sql = str(table_sql_row["sql"] or "") if table_sql_row is not None else ""
+    if "category IN ('event', 'service')" in table_sql:
+        # Legacy table constrained category too tightly for real business data.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_submissions_v2 (
+              id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              description TEXT NOT NULL DEFAULT '',
+              tags TEXT NOT NULL DEFAULT '[]',
+              category TEXT NOT NULL,
+              intent_tags TEXT NOT NULL DEFAULT '[]',
+              event_time TEXT,
+              start_date TEXT,
+              location TEXT,
+              contact_info TEXT,
+              source TEXT NOT NULL DEFAULT 'user',
+              status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected')),
+              is_featured INTEGER NOT NULL DEFAULT 0,
+              featured_until TEXT,
+              view_count INTEGER NOT NULL DEFAULT 0,
+              click_count INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        desc_expr = "description" if "description" in cols else "''"
+        tags_expr = "tags" if "tags" in cols else "'[]'"
+        src_expr = "source" if "source" in cols else "'user'"
+        status_expr = "status" if "status" in cols else "'pending'"
+        is_featured_expr = "is_featured" if "is_featured" in cols else "0"
+        featured_until_expr = "featured_until" if "featured_until" in cols else "NULL"
+        view_count_expr = "view_count" if "view_count" in cols else "0"
+        click_count_expr = "click_count" if "click_count" in cols else "0"
+        created_expr = "created_at" if "created_at" in cols else "datetime('now')"
+        updated_expr = "updated_at" if "updated_at" in cols else "datetime('now')"
+        start_expr = "start_date" if "start_date" in cols else "NULL"
+        location_expr = "location" if "location" in cols else "NULL"
+        conn.execute(
+            f"""
+            INSERT INTO user_submissions_v2 (
+              id, title, description, tags, category, intent_tags, event_time, start_date, location, contact_info,
+              source, status, is_featured, featured_until, view_count, click_count, created_at, updated_at
+            )
+            SELECT
+              id, title, {desc_expr}, {tags_expr}, category, '[]',
+              {start_expr}, {start_expr}, {location_expr}, NULL,
+              {src_expr}, {status_expr}, {is_featured_expr}, {featured_until_expr},
+              {view_count_expr}, {click_count_expr}, {created_expr}, {updated_expr}
+            FROM user_submissions
+            """
+        )
+        conn.execute("DROP TABLE user_submissions")
+        conn.execute("ALTER TABLE user_submissions_v2 RENAME TO user_submissions")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_submissions_status ON user_submissions (status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_submissions_start_date ON user_submissions (start_date)")
+        conn.commit()
+        cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(user_submissions)")}
     if "is_featured" not in cols:
         conn.execute("ALTER TABLE user_submissions ADD COLUMN is_featured INTEGER NOT NULL DEFAULT 0")
     if "featured_until" not in cols:
@@ -405,6 +467,20 @@ def _migrate_user_submissions_featured(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE user_submissions ADD COLUMN view_count INTEGER NOT NULL DEFAULT 0")
     if "click_count" not in cols:
         conn.execute("ALTER TABLE user_submissions ADD COLUMN click_count INTEGER NOT NULL DEFAULT 0")
+    if "intent_tags" not in cols:
+        conn.execute("ALTER TABLE user_submissions ADD COLUMN intent_tags TEXT NOT NULL DEFAULT '[]'")
+    if "event_time" not in cols:
+        conn.execute("ALTER TABLE user_submissions ADD COLUMN event_time TEXT")
+    if "contact_info" not in cols:
+        conn.execute("ALTER TABLE user_submissions ADD COLUMN contact_info TEXT")
+    # Keep legacy start_date/event_time in sync for older rows used by current ranking/search.
+    conn.execute(
+        """
+        UPDATE user_submissions
+        SET event_time = COALESCE(NULLIF(trim(event_time), ''), NULLIF(trim(start_date), '')),
+            start_date = COALESCE(NULLIF(trim(start_date), ''), NULLIF(trim(event_time), ''))
+        """
+    )
     conn.commit()
 
 

@@ -1,7 +1,10 @@
 .venv/
+venv/
 .pytest_cache/
 __pycache__/
 *.pyc
+.env
+node_modules/
 
 havasu.db
 

@@ -10,8 +10,9 @@ def _payload(title: str) -> dict:
         "title": title,
         "description": "submitted from tests",
         "tags": ["plumber", "repair"],
+        "intent_tags": ["emergency", "after hours"],
         "category": "service",
-        "start_date": "2026-06-15",
+        "event_time": "2026-06-15T18:00:00",
         "location": "Lake Havasu",
     }
 
@@ -74,14 +75,14 @@ def test_approved_shows_in_search(fresh_db, admin_headers: dict[str, str]) -> No
     assert title in titles
 
 
-def test_non_havasu_rejected(fresh_db) -> None:
+def test_non_havasu_allowed(fresh_db) -> None:
     _ = fresh_db
     c = TestClient(app)
     body = _payload("Out of Area")
     body["location"] = "Phoenix"
     r = c.post("/submit", json=body)
-    assert r.status_code == 400
-    assert "Only Lake Havasu submissions are allowed" in r.text
+    assert r.status_code == 200
+    assert r.json()["success"] is True
 
 
 def test_missing_title_rejected(fresh_db) -> None:
@@ -94,14 +95,24 @@ def test_missing_title_rejected(fresh_db) -> None:
     assert r.json() == {"error": "invalid_submission"}
 
 
-def test_missing_required_fields_rejected(fresh_db) -> None:
+def test_missing_event_time_allowed(fresh_db) -> None:
     _ = fresh_db
     c = TestClient(app)
     body = _payload("Valid Title")
-    body["start_date"] = ""
+    body["event_time"] = ""
+    r = c.post("/submit", json=body)
+    assert r.status_code == 200
+    assert r.json()["success"] is True
+
+
+def test_missing_category_rejected(fresh_db) -> None:
+    _ = fresh_db
+    c = TestClient(app)
+    body = _payload("Valid Title")
+    body["category"] = "   "
     r = c.post("/submit", json=body)
     assert r.status_code == 400
-    assert r.json() == {"error": "invalid_submission"}
+    assert "category is required" in r.text
 
 
 def test_bad_title_rejected(fresh_db) -> None:
@@ -286,6 +297,33 @@ def test_notifications_feed_includes_new_approved_item(fresh_db, admin_headers: 
     hit = next((x for x in approved_body["items"] if x.get("id") == sid), None)
     assert hit is not None
     assert hit["title"] == "Notify Me Event"
+
+
+def test_intent_tags_not_exposed_publicly(fresh_db, admin_headers: dict[str, str]) -> None:
+    _ = fresh_db
+    c = TestClient(app)
+    sid = c.post("/submit", json=_payload("Hidden Intent Service")).json()["id"]
+    assert c.post("/admin/approve", params={"id": sid}, headers=admin_headers).status_code == 200
+    search_body = c.get("/search", params={"q": "Hidden Intent Service"}).json()
+    assert all("intent_tags" not in row for row in search_body.get("results", []))
+    admin_rows = c.get("/admin/submissions", params={"status": "approved"}, headers=admin_headers).json()
+    admin_hit = next((x for x in admin_rows if x.get("id") == sid), None)
+    assert admin_hit is not None
+    assert "intent_tags" not in admin_hit
+
+
+def test_admin_path_approve_and_reject_flow(fresh_db, admin_headers: dict[str, str]) -> None:
+    _ = fresh_db
+    c = TestClient(app)
+    sid = c.post("/submit", json=_payload("Path Approval Listing")).json()["id"]
+    assert c.post(f"/admin/approve/{sid}", headers=admin_headers).status_code == 200
+    approved_rows = c.get("/admin/submissions", params={"status": "approved"}, headers=admin_headers).json()
+    assert any(x.get("id") == sid for x in approved_rows)
+    assert c.post(f"/admin/reject/{sid}", headers=admin_headers).status_code == 200
+    approved_rows_2 = c.get("/admin/submissions", params={"status": "approved"}, headers=admin_headers).json()
+    rejected_rows = c.get("/admin/submissions", params={"status": "rejected"}, headers=admin_headers).json()
+    assert all(x.get("id") != sid for x in approved_rows_2)
+    assert any(x.get("id") == sid for x in rejected_rows)
 
 
 def test_admin_endpoints_require_token(fresh_db) -> None:

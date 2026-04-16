@@ -7,6 +7,7 @@ import os
 import re
 import hashlib
 import time
+import uuid
 from pathlib import Path
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -54,7 +55,6 @@ from db.activities import (
     ActivityInput,
     SlotInput,
     build_event_embedding_text,
-    delete_activity,
     get_event_click_counts,
     get_ai_clicked_weights,
     increment_activity_click,
@@ -70,12 +70,12 @@ from db.database import count_events_by_source, get_item_payload_by_id, init_db,
 from db.submissions import (
     clear_submission_featured,
     create_submission,
-    delete_submission,
     find_duplicate_submission_id,
     increment_submission_click,
     increment_submission_view,
     list_notifications_feed,
     list_approved_submission_payloads,
+    list_approved_submission_payloads_for_ai,
     list_pending_submissions,
     list_submissions,
     set_submission_featured,
@@ -88,6 +88,7 @@ LIMIT_MAX = 200
 TRACK_DEDUP_WINDOW_SEC_VIEW = 600.0
 TRACK_DEDUP_WINDOW_SEC_CLICK = 600.0
 ENABLE_SEED_DATA = True
+ENABLE_REAL_DATA = True
 WEIGHTS = {
     "click": 1.5,
     "popularity": 0.3,
@@ -107,6 +108,25 @@ logger = logging.getLogger(__name__)
 _track_seen: dict[str, float] = {}
 _embedding_cache: dict[str, list[float]] = {}
 _seed_cache: list[dict[str, Any]] | None = None
+_real_data_cache: list[dict[str, Any]] | None = None
+_real_data_stats: dict[str, Any] = {}
+_ai_intake_sessions: dict[str, dict[str, Any]] = {}
+
+_INTAKE_CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "plumber": ("plumb", "drain", "pipe", "septic"),
+    "electrician": ("electric", "wiring", "outlet", "panel"),
+    "restaurant": ("restaurant", "food", "dinner", "cafe", "bistro"),
+    "nightlife": ("bar", "club", "nightlife", "cocktail", "dj"),
+    "kids_activities": ("kids", "sports", "youth", "after school", "child"),
+}
+
+_INTENT_KEYWORD_MAP: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("emergency", "after hours"), "emergency"),
+    (("water heater",), "water_heater"),
+    (("drain", "clog"), "drain"),
+    (("residential",), "residential"),
+    (("commercial",), "commercial"),
+)
 
 
 class SearchAISection(BaseModel):
@@ -128,9 +148,12 @@ class SubmitRequest(BaseModel):
     title: str
     description: str = ""
     tags: list[str] = Field(default_factory=list)
+    intent_tags: list[str] = Field(default_factory=list)
     category: str
+    event_time: str | None = None
     start_date: str | None = None
-    location: str = "Lake Havasu"
+    location: str | None = None
+    contact_info: str | None = None
 
 
 class SubmitResponse(BaseModel):
@@ -192,6 +215,19 @@ class AIClickRequest(BaseModel):
     clicked_id: str = Field(..., min_length=1)
 
 
+class AIIntakeStartRequest(BaseModel):
+    message: str = Field(..., min_length=1)
+
+
+class AIIntakeAnswerRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    answer: str = Field(..., min_length=1)
+
+
+class AIIntakeSubmitRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+
+
 def _sanitize_ai_suggestions(value: Any) -> list[str]:
     if not isinstance(value, list):
         return fallback_generic_suggestions()
@@ -220,6 +256,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(RateLimitMiddleware)
+
+# Ensure DB schema/migrations exist for direct TestClient usage paths.
+try:
+    init_db()
+except Exception:
+    logger.exception("database initialization failed")
 
 
 def _is_valid_admin_token_header(header_value: str | None) -> bool:
@@ -257,6 +299,11 @@ _WEEKDAY_ORDER = {
     "saturday": 5,
     "sunday": 6,
 }
+
+
+@app.get("/")
+def root_status() -> dict[str, str]:
+    return {"status": "running"}
 
 
 def _parse_iso_date(value: str | None) -> date | None:
@@ -314,6 +361,48 @@ def _crawler_items_for_query(
     return list_items(item_type=item_type or None, source=source or None)
 
 
+def _load_real_data_rows(*, include_internal_fields: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    global _real_data_cache, _real_data_stats
+    if not ENABLE_REAL_DATA:
+        return [], {"total_loaded": 0, "duplicates_skipped": 0}
+    if _real_data_cache is None:
+        try:
+            from scripts.load_businesses import load_businesses
+        except Exception as exc:
+            logger.warning("real-data loader unavailable: %s", exc)
+            _real_data_cache = []
+            _real_data_stats = {"total_loaded": 0, "duplicates_skipped": 0}
+        else:
+            loaded, stats = load_businesses()
+            _real_data_cache = loaded if isinstance(loaded, list) else []
+            _real_data_stats = stats if isinstance(stats, dict) else {}
+
+    rows = [dict(r) for r in (_real_data_cache or [])]
+    if not include_internal_fields:
+        for row in rows:
+            row.pop("intent_tags", None)
+    return rows, dict(_real_data_stats)
+
+
+def _dedupe_rows_by_id(
+    rows: list[dict[str, Any]],
+    *,
+    existing_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    out: list[dict[str, Any]] = []
+    seen = set(existing_ids or set())
+    skipped = 0
+    for row in rows:
+        rid = str((row or {}).get("id") or "").strip()
+        if rid and rid in seen:
+            skipped += 1
+            continue
+        if rid:
+            seen.add(rid)
+        out.append(row)
+    return out, skipped
+
+
 def _combined_read_rows(item_type: str | None, source: str | None) -> list[dict]:
     """Crawler `items` plus approved `user_events` where filters allow."""
     t = item_type
@@ -325,17 +414,41 @@ def _combined_read_rows(item_type: str | None, source: str | None) -> list[dict]
         if t in (None, "event"):
             return u
         return []
+    if src == "real":
+        if t in ("recurring", "program"):
+            return []
+        real_rows, _ = _load_real_data_rows(include_internal_fields=False)
+        return real_rows if t in (None, "event") else []
     if t in ("recurring", "program"):
         return _crawler_items_for_query(t, src)
     crawl = _crawler_items_for_query(t, src)
     if t in (None, "event"):
-        return crawl + list_user_event_payloads_for_public() + list_approved_submission_payloads()
+        real_rows, _ = _load_real_data_rows(include_internal_fields=False)
+        merged_inputs = crawl + list_user_event_payloads_for_public() + list_approved_submission_payloads()
+        if src is None:
+            merged_inputs += real_rows
+        merged, _ = _dedupe_rows_by_id(merged_inputs)
+        return merged
     return crawl
+
+
+def _combined_read_rows_for_ai() -> list[dict]:
+    """AI context rows include approved submissions with internal intent metadata."""
+    real_rows, _ = _load_real_data_rows(include_internal_fields=True)
+    merged, _ = _dedupe_rows_by_id(
+        _crawler_items_for_query(None, None)
+        + list_user_event_payloads_for_public()
+        + list_approved_submission_payloads_for_ai()
+        + real_rows
+    )
+    return merged
 
 
 def _all_calendar_event_payloads() -> list[dict]:
     """All dated calendar events: crawled + user-submitted."""
-    return list_events(source=None) + list_user_event_payloads_for_public() + list_approved_submission_payloads()
+    real_rows, _ = _load_real_data_rows(include_internal_fields=False)
+    merged, _ = _dedupe_rows_by_id(list_events(source=None) + list_user_event_payloads_for_public() + list_approved_submission_payloads() + real_rows)
+    return merged
 
 
 def _normalize_submit_tags(tags: list[str]) -> list[str]:
@@ -348,6 +461,105 @@ def _normalize_submit_tags(tags: list[str]) -> list[str]:
         seen.add(s)
         out.append(s)
     return out[:12]
+
+
+def _detect_intake_category(message: str) -> str:
+    text = (message or "").strip().lower()
+    for category, words in _INTAKE_CATEGORY_KEYWORDS.items():
+        if any(w in text for w in words):
+            return category
+    return "general_business"
+
+
+def get_questions_for_category(category: str) -> list[str]:
+    c = (category or "").strip().lower()
+    if c == "plumber":
+        return [
+            "What is your business name?",
+            "Do you offer emergency or after-hours service?",
+            "What services do you provide? (drains, water heater, etc.)",
+            "Do you serve residential, commercial, or both?",
+            "What city are you located in?",
+        ]
+    if c == "electrician":
+        return [
+            "What is your business name?",
+            "What electrical services do you provide?",
+            "Do you handle emergency calls?",
+            "Do you serve residential, commercial, or both?",
+            "What city are you located in?",
+        ]
+    if c == "restaurant":
+        return [
+            "What is your business name?",
+            "What type of food do you serve?",
+            "What are your primary dining hours?",
+            "Is your place family-friendly, date-night focused, or both?",
+            "What city are you located in?",
+        ]
+    if c == "nightlife":
+        return [
+            "What is your business name?",
+            "What kind of nightlife experience do you offer?",
+            "Do you have live music, DJ nights, or both?",
+            "What are your typical open hours?",
+            "What city are you located in?",
+        ]
+    if c == "kids_activities":
+        return [
+            "What is your business or program name?",
+            "What activities do you offer for kids?",
+            "What age groups do you serve?",
+            "Do you run weekday, weekend, or both schedules?",
+            "What city are you located in?",
+        ]
+    return [
+        "What is your business name?",
+        "What service or experience do you offer?",
+        "Who is your primary customer?",
+        "What makes your business unique?",
+        "What city are you located in?",
+    ]
+
+
+def _extract_intent_tags_from_answers(answers: list[str]) -> list[str]:
+    text = " ".join(str(a or "").strip().lower() for a in answers)
+    tags: list[str] = []
+    for triggers, tag in _INTENT_KEYWORD_MAP:
+        if any(word in text for word in triggers) and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def build_submission_from_answers(session: dict[str, Any]) -> dict[str, Any]:
+    answers = session.get("answers") if isinstance(session.get("answers"), list) else []
+    questions = session.get("questions") if isinstance(session.get("questions"), list) else []
+    title = str(answers[0]).strip() if answers else ""
+    location = ""
+    for idx, q in enumerate(questions):
+        ql = str(q).lower()
+        if "city" in ql or "located" in ql:
+            if idx < len(answers):
+                location = str(answers[idx]).strip()
+            break
+    description_parts: list[str] = []
+    for idx, answer in enumerate(answers):
+        a = str(answer or "").strip()
+        if not a:
+            continue
+        q = str(questions[idx] if idx < len(questions) else "").strip()
+        description_parts.append(f"{q} {a}" if q else a)
+    description = " | ".join(description_parts)[:1200]
+    intent_tags = _extract_intent_tags_from_answers([str(a) for a in answers])
+    return {
+        "title": title,
+        "description": description,
+        "category": str(session.get("category") or "general_business").strip().lower(),
+        "intent_tags": intent_tags,
+        "tags": intent_tags[:],
+        "location": location,
+        "status": "pending",
+    }
 
 
 def _tracking_now() -> float:
@@ -401,15 +613,24 @@ def _is_junk_title(title: str) -> bool:
 
 
 def _events_for_ai_context(*, limit: int = 75) -> list[dict[str, Any]]:
-    rows = _combined_read_rows(None, None) + list_expanded_slot_payloads()
+    rows = _combined_read_rows_for_ai() + list_expanded_slot_payloads()
     normalized = finalize_api_list(rows if isinstance(rows, list) else [], False)
     candidates = [r for r in normalized if str(r.get("id") or "").strip()]
 
-    # Keep context reasonably fresh/time-aware before handing to model.
-    def key(row: dict[str, Any]) -> tuple[int, str]:
-        sd = str(row.get("start_date") or "")
-        has_date = 0 if sd else 1
-        return (has_date, sd)
+    # Keep context fresh/time-aware before handing to model.
+    def key(row: dict[str, Any]) -> tuple[int, float]:
+        sd = str(row.get("start_date") or "").strip()
+        dt = _parse_start_datetime(sd) if sd else None
+        if dt is None and sd:
+            try:
+                d = date.fromisoformat(sd[:10])
+                dt = datetime(d.year, d.month, d.day)
+            except ValueError:
+                dt = None
+        has_date = 0 if dt is not None else 1
+        # Newer dated items should win over stale dated inventory.
+        freshness = -float(dt.timestamp()) if dt is not None else 0.0
+        return (has_date, freshness)
 
     candidates.sort(key=key)
     deduped: list[dict[str, Any]] = []
@@ -460,7 +681,10 @@ def _load_seed_events() -> list[dict[str, Any]]:
         description = str(item.get("description") or "").strip()
         category = str(item.get("category") or "").strip().lower()
         location = str(item.get("location") or "").strip() or "Lake Havasu City"
-        popularity = int(item.get("popularity") or 1)
+        try:
+            popularity = int(item.get("popularity") or 1)
+        except (TypeError, ValueError):
+            popularity = 1
         intent_tags = item.get("intent_tags") if isinstance(item.get("intent_tags"), list) else []
         event_time = str(item.get("event_time") or "").strip()
         tags = [t for t in re.split(r"[^a-z0-9]+", f"{category} {title}".lower()) if len(t) >= 3][:8]
@@ -904,10 +1128,28 @@ def ai_recommend(body: AIRecommendRequest, debug: bool = Query(False)) -> list[A
     query = body.query.strip()
     real_events = _events_for_ai_context(limit=150)
     seed_events = _load_seed_events() if ENABLE_SEED_DATA else []
-    events = real_events + seed_events
+    events: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for row in real_events + seed_events:
+        rid = str((row or {}).get("id") or "").strip()
+        if rid and rid in seen_ids:
+            continue
+        if rid:
+            seen_ids.add(rid)
+        events.append(row)
     events, filter_stats = _filter_stale_ai_events(events)
     filter_stats["seed_event_count"] = len(seed_events)
     filter_stats["real_event_count"] = len(real_events)
+    _, real_stats = _load_real_data_rows(include_internal_fields=False)
+    filter_stats["real_data_loaded"] = int(real_stats.get("inserted_count") or real_stats.get("total_loaded") or 0)
+    filter_stats["real_data_duplicates_skipped"] = int(real_stats.get("duplicates_skipped") or 0)
+    filter_stats["total_final_dataset_size"] = len(events)
+    logger.info(
+        "real_data_loader total_loaded=%s duplicates_skipped=%s total_final_dataset_size=%s",
+        filter_stats["real_data_loaded"],
+        filter_stats["real_data_duplicates_skipped"],
+        filter_stats["total_final_dataset_size"],
+    )
     payload = _format_for_ai(events)
     if not payload:
         return []
@@ -1040,6 +1282,81 @@ def ai_click(body: AIClickRequest) -> dict[str, bool]:
     return {"success": True}
 
 
+@app.post("/ai/intake/start")
+def ai_intake_start(body: AIIntakeStartRequest) -> dict[str, Any]:
+    message = body.message.strip()
+    category = _detect_intake_category(message)
+    questions = get_questions_for_category(category)
+    session_id = f"intake-{uuid.uuid4().hex[:16]}"
+    _ai_intake_sessions[session_id] = {
+        "session_id": session_id,
+        "message": message,
+        "category": category,
+        "questions": questions,
+        "answers": [],
+    }
+    return {
+        "session_id": session_id,
+        "category": category,
+        "questions": questions,
+    }
+
+
+@app.post("/ai/intake/answer")
+def ai_intake_answer(body: AIIntakeAnswerRequest) -> dict[str, Any]:
+    session = _ai_intake_sessions.get(body.session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    questions = session.get("questions") if isinstance(session.get("questions"), list) else []
+    answers = session.get("answers") if isinstance(session.get("answers"), list) else []
+    if len(answers) >= len(questions):
+        preview = build_submission_from_answers(session)
+        return {"done": True, "preview": preview}
+
+    answers.append(body.answer.strip())
+    session["answers"] = answers
+    if len(answers) < len(questions):
+        return {
+            "next_question": str(questions[len(answers)]),
+            "done": False,
+        }
+    preview = build_submission_from_answers(session)
+    return {"done": True, "preview": preview}
+
+
+@app.post("/ai/intake/submit")
+def ai_intake_submit(body: AIIntakeSubmitRequest) -> dict[str, Any]:
+    session = _ai_intake_sessions.get(body.session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    preview = build_submission_from_answers(session)
+    if not str(preview.get("title") or "").strip():
+        raise HTTPException(status_code=400, detail="title is required")
+    if not str(preview.get("category") or "").strip():
+        raise HTTPException(status_code=400, detail="category is required")
+    if not str(preview.get("location") or "").strip():
+        raise HTTPException(status_code=400, detail="location is required")
+
+    result = submit_item(
+        SubmitRequest(
+            title=str(preview.get("title") or ""),
+            description=str(preview.get("description") or ""),
+            tags=list(preview.get("tags") or []),
+            intent_tags=list(preview.get("intent_tags") or []),
+            category=str(preview.get("category") or ""),
+            event_time=None,
+            location=str(preview.get("location") or ""),
+            contact_info=None,
+        )
+    )
+    return {
+        "success": bool(result.success),
+        "id": result.id,
+        "duplicate": bool(result.duplicate),
+        "status": "pending",
+    }
+
+
 @app.get("/debug/ai-status")
 def debug_ai_status() -> dict[str, Any]:
     has_key = has_openai_key() and OpenAI is not None
@@ -1072,20 +1389,19 @@ def debug_ai_weight_check() -> dict[str, Any]:
 @app.post("/submit", response_model=SubmitResponse)
 def submit_item(body: SubmitRequest) -> SubmitResponse:
     title = body.title.strip()
-    start_date = (body.start_date or "").strip()
-    location = (body.location or "").strip()
-    if not title or not start_date or not location:
+    event_time = (body.event_time or body.start_date or "").strip()
+    location = (body.location or "").strip() or None
+    contact_info = (body.contact_info or "").strip() or None
+    if not title:
         return JSONResponse(status_code=400, content={"error": "invalid_submission"})
     if _is_junk_title(title):
         return JSONResponse(status_code=400, content={"error": "invalid_submission"})
     category = body.category.strip().lower()
-    if category not in ("event", "service"):
-        raise HTTPException(status_code=400, detail="category must be event or service")
-    if "havasu" not in location.lower():
-        raise HTTPException(status_code=400, detail="Only Lake Havasu submissions are allowed")
+    if not category:
+        raise HTTPException(status_code=400, detail="category is required")
     dup_id = find_duplicate_submission_id(
         normalized_title=" ".join(title.lower().split()),
-        start_date=start_date,
+        event_time=event_time,
     )
     if dup_id:
         return SubmitResponse(success=True, id=dup_id, duplicate=True)
@@ -1093,9 +1409,11 @@ def submit_item(body: SubmitRequest) -> SubmitResponse:
         title=title,
         description=(body.description or "").strip(),
         tags=_normalize_submit_tags(body.tags),
+        intent_tags=_normalize_submit_tags(body.intent_tags),
         category=category,
-        start_date=start_date,
+        event_time=event_time or None,
         location=location,
+        contact_info=contact_info,
     )
     return SubmitResponse(success=True, id=sid)
 
@@ -1158,6 +1476,12 @@ def admin_list_submissions(status: str = Query("pending")) -> list[dict[str, Any
 
 @app.post("/admin/approve")
 def admin_approve_submission(id: str = Query(..., min_length=1)) -> dict[str, bool]:
+    return admin_approve_submission_by_id(id)
+
+
+@app.post("/admin/approve/{submission_id}")
+def admin_approve_submission_by_id(submission_id: str) -> dict[str, bool]:
+    id = submission_id.strip()
     if id.startswith("a-"):
         ok = set_activity_status(id, "approved")
         if not ok:
@@ -1171,13 +1495,18 @@ def admin_approve_submission(id: str = Query(..., min_length=1)) -> dict[str, bo
 
 @app.post("/admin/reject")
 def admin_reject_submission(id: str = Query(..., min_length=1)) -> dict[str, bool]:
+    return admin_reject_submission_by_id(id)
+
+
+@app.post("/admin/reject/{submission_id}")
+def admin_reject_submission_by_id(submission_id: str) -> dict[str, bool]:
+    id = submission_id.strip()
     if id.startswith("a-"):
-        ok = delete_activity(id) or set_activity_status(id, "rejected")
+        ok = set_activity_status(id, "rejected")
         if not ok:
             raise HTTPException(status_code=404, detail="Activity not found")
         return {"success": True}
-    # Keep rejected rows out of pending/live; remove to keep table clean.
-    ok = delete_submission(id) or update_submission_status(id, "rejected")
+    ok = update_submission_status(id, "rejected")
     if not ok:
         raise HTTPException(status_code=404, detail="Submission not found")
     return {"success": True}
@@ -1525,4 +1854,11 @@ def get_events_summary() -> dict:
         "with_location": with_location,
         "with_time": with_time,
     }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("api.main:app", host="0.0.0.0", port=port)
 

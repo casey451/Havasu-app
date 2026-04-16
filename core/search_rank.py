@@ -154,13 +154,16 @@ def score_item(item: dict[str, Any], intent: dict[str, Any], *, query: str = "")
     ev_date = _parse_event_date(item)
     today = datetime.now(UTC).date()
     if ev_date is not None:
-        event_dt = datetime.combine(ev_date, datetime.min.time(), tzinfo=UTC)
+        # Date-only events are treated as "active through end of day" so they
+        # do not flip to past immediately after midnight UTC.
+        event_dt = datetime.combine(ev_date, datetime.max.time(), tzinfo=UTC)
         age_hours = (event_dt - datetime.now(UTC)).total_seconds() / 3600.0
-        if 24 < age_hours <= 72:
+        # Nearer future events must rank above farther future events.
+        if 0 <= age_hours <= 24:
             relevance_boost += 0.5
-        elif 72 < age_hours <= 168:
+        elif 24 < age_hours <= 72:
             relevance_boost += 0.3
-        elif 0 <= age_hours <= 24:
+        elif 72 < age_hours <= 168:
             relevance_boost += 0.2
         elif 168 < age_hours <= 504:
             relevance_boost += 0.1
