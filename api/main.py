@@ -461,6 +461,7 @@ def _load_seed_events() -> list[dict[str, Any]]:
         category = str(item.get("category") or "").strip().lower()
         location = str(item.get("location") or "").strip() or "Lake Havasu City"
         popularity = int(item.get("popularity") or 1)
+        intent_tags = item.get("intent_tags") if isinstance(item.get("intent_tags"), list) else []
         event_time = str(item.get("event_time") or "").strip()
         tags = [t for t in re.split(r"[^a-z0-9]+", f"{category} {title}".lower()) if len(t) >= 3][:8]
         row: dict[str, Any] = {
@@ -476,6 +477,7 @@ def _load_seed_events() -> list[dict[str, Any]]:
             "is_seed": bool(item.get("is_seed", True)),
             "view_count": 0,
             "click_count": max(0, popularity),
+            "intent_tags": [str(t).strip() for t in intent_tags if str(t).strip()],
         }
         if event_time:
             row["start_date"] = event_time
@@ -545,6 +547,7 @@ def _format_for_ai(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "description": str(e.get("description") or ""),
                 "category": str(e.get("category") or ""),
                 "tags": e.get("tags") if isinstance(e.get("tags"), list) else [],
+                "intent_tags": e.get("intent_tags") if isinstance(e.get("intent_tags"), list) else [],
                 "start": str(e.get("start_date") or ""),
                 "end": str(e.get("end_date") or ""),
                 "location": str(e.get("location") or e.get("location_label") or ""),

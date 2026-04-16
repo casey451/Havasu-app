@@ -480,8 +480,10 @@ def build_event_embedding_text(event: dict[str, Any]) -> str:
     description = str(event.get("description") or "").strip()
     category = str(event.get("category") or "").strip()
     tags = event.get("tags") if isinstance(event.get("tags"), list) else []
+    intent_tags = event.get("intent_tags") if isinstance(event.get("intent_tags"), list) else []
     tags_text = " ".join(str(t).strip() for t in tags if str(t).strip())
-    return " ".join(part for part in [title, description, category, tags_text] if part).strip()
+    intent_text = " ".join(str(t).strip() for t in intent_tags if str(t).strip())
+    return " ".join(part for part in [title, description, category, tags_text, intent_text] if part).strip()
 
 
 def _expand_slot_dates(
