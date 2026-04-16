@@ -47,9 +47,11 @@ from core.serialize import (
 )
 from core.user_event_map import map_user_event_row_to_item_payload
 from db.accounts import (
+    get_business_by_email,
     get_business_by_id,
     get_user_event_with_profile_fields,
     list_user_event_payloads_for_public,
+    update_business_role_by_email,
 )
 from db.activities import (
     ActivityInput,
@@ -226,6 +228,10 @@ class AIIntakeAnswerRequest(BaseModel):
 
 class AIIntakeSubmitRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
+
+
+class DevMakeAdminRequest(BaseModel):
+    email: str = Field(..., min_length=3)
 
 
 def _sanitize_ai_suggestions(value: Any) -> list[str]:
@@ -1354,6 +1360,27 @@ def ai_intake_submit(body: AIIntakeSubmitRequest) -> dict[str, Any]:
         "id": result.id,
         "duplicate": bool(result.duplicate),
         "status": "pending",
+    }
+
+
+# REMOVE AFTER USE: temporary operational endpoint for one-time role promotion.
+@app.post("/dev/make-admin")
+def dev_make_admin(body: DevMakeAdminRequest) -> dict[str, Any]:
+    email = body.email.strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required")
+    row = get_business_by_email(email)
+    if row is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    updated = update_business_role_by_email(email, "admin")
+    if updated is None:
+        raise HTTPException(status_code=500, detail="Update failed")
+    return {
+        "id": int(updated["id"]),
+        "email": str(updated["email"]),
+        "name": str(updated["name"]),
+        "role": str(updated["role"]),
+        "status": str(updated["status"]),
     }
 
 

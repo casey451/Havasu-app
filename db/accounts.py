@@ -57,6 +57,30 @@ def update_business_status(bid: int, status: Status) -> bool:
         return cur.rowcount > 0
 
 
+def update_business_role_by_email(email: str, role: Role) -> dict[str, Any] | None:
+    now = utc_now_iso()
+    normalized = (email or "").strip().lower()
+    if not normalized:
+        return None
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM businesses WHERE lower(trim(email)) = lower(trim(?))",
+            (normalized,),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            "UPDATE businesses SET role = ?, updated_at = ? WHERE id = ?",
+            (role, now, int(row["id"])),
+        )
+        conn.commit()
+        updated = conn.execute(
+            "SELECT id, email, name, role, status FROM businesses WHERE id = ?",
+            (int(row["id"]),),
+        ).fetchone()
+        return dict(updated) if updated else None
+
+
 def list_pending_business_ids() -> list[int]:
     with get_connection() as conn:
         rows = conn.execute(
